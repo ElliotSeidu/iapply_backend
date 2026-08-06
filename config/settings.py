@@ -180,3 +180,7 @@ STATIC_ROOT = BASE_DIR / 'staticfiles'
 MEDIA_URL = '/media/'
 MEDIA_ROOT = BASE_DIR / 'media'
 AUTH_USER_MODEL = 'accounts.User'
+
+# Email settings for development: prints emails to console
+DEFAULT_FROM_EMAIL = 'no-reply@example.com'
+EMAIL_BACKEND = 'django.core.mail.backends.console.EmailBackend'
