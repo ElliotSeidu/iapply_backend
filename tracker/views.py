@@ -57,10 +57,16 @@ class ApplicationViewSet(viewsets.ModelViewSet):
     def stale(self, request):
         """Applications sitting with no movement past the threshold —
         drives the follow-up nudge feature."""
-        stale_ids = [
-            app.id for app in self.get_queryset() if app.is_stale()
+        active_statuses = [
+            Application.Status.APPLIED,
+            Application.Status.OA,
+            Application.Status.INTERVIEW,
         ]
-        queryset = self.get_queryset().filter(id__in=stale_ids)
+        stale_threshold = timezone.now().date() - timezone.timedelta(days=21)
+        queryset = self.get_queryset().filter(
+            current_status__in=active_statuses,
+            date_applied__lte=stale_threshold,
+        )
         serializer = self.get_serializer(queryset, many=True)
         return Response(serializer.data)
 

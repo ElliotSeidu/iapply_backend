@@ -63,14 +63,21 @@ class LogoutSerializer(serializers.Serializer):
     refresh = serializers.CharField()
 
     def validate(self, attrs):
-        self.token = attrs['refresh']
+        try:
+            self.token = RefreshToken(attrs['refresh'])
+        except Exception as exc:
+            raise serializers.ValidationError("Invalid or expired token") from exc
+
+        request_user = self.context['request'].user
+        if str(self.token.get('user_id')) != str(request_user.pk):
+            raise serializers.ValidationError("Invalid or expired token")
         return attrs
 
     def save(self, **kwargs):
         try:
-            RefreshToken(self.token).blacklist()
-        except Exception:
-            raise serializers.ValidationError("Invalid or expired token")
+            self.token.blacklist()
+        except Exception as exc:
+            raise serializers.ValidationError("Invalid or expired token") from exc
 
 
 class ChangePasswordSerializer(serializers.Serializer):

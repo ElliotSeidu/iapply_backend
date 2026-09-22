@@ -1,6 +1,9 @@
 from django.test import TestCase
 from django.urls import reverse
 from unittest.mock import patch
+from rest_framework.test import APIClient
+from rest_framework_simplejwt.token_blacklist.models import BlacklistedToken
+from rest_framework_simplejwt.tokens import RefreshToken
 
 from .models import EmailVerification, User
 
@@ -47,3 +50,43 @@ class EmailVerificationTests(TestCase):
 		# user should exist and record deleted
 		self.assertTrue(User.objects.filter(email='verifyme@example.com').exists())
 		self.assertFalse(EmailVerification.objects.filter(email='verifyme@example.com').exists())
+
+
+class SessionRevocationTests(TestCase):
+	def setUp(self):
+		self.client = APIClient()
+		self.user = User.objects.create_user(
+			email='session@example.com',
+			password='StrongPassw0rd!',
+		)
+		self.client.force_authenticate(user=self.user)
+
+	def test_logout_only_blacklists_authenticated_users_refresh_token(self):
+		refresh = RefreshToken.for_user(self.user)
+		response = self.client.post(
+			reverse('logout'),
+			data={'refresh': str(refresh)},
+			content_type='application/json',
+		)
+
+		self.assertEqual(response.status_code, 205)
+		self.assertTrue(
+			BlacklistedToken.objects.filter(token__token=str(refresh)).exists()
+		)
+
+	def test_password_change_revokes_all_refresh_tokens(self):
+		refresh = RefreshToken.for_user(self.user)
+		response = self.client.patch(
+			reverse('change-password'),
+			data={
+				'old_password': 'StrongPassw0rd!',
+				'new_password': 'NewStrongPassw0rd!',
+				'new_password2': 'NewStrongPassw0rd!',
+			},
+			content_type='application/json',
+		)
+
+		self.assertEqual(response.status_code, 200)
+		self.assertTrue(
+			BlacklistedToken.objects.filter(token__token=str(refresh)).exists()
+		)

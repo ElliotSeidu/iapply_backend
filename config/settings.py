@@ -55,7 +55,7 @@ SECURE_SSL_REDIRECT = config('SECURE_SSL_REDIRECT', default=not DEBUG, cast=bool
 SESSION_COOKIE_SECURE = config('SESSION_COOKIE_SECURE', default=not DEBUG, cast=bool)
 CSRF_COOKIE_SECURE = config('CSRF_COOKIE_SECURE', default=not DEBUG, cast=bool)
 SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
-USE_X_FORWARDED_HOST = config('USE_X_FORWARDED_HOST', default=True, cast=bool)
+USE_X_FORWARDED_HOST = config('USE_X_FORWARDED_HOST', default=False, cast=bool)
 
 # X-Content-Type-Options: nosniff prevents MIME-sniffing attacks.
 SECURE_CONTENT_TYPE_NOSNIFF = True
@@ -200,8 +200,7 @@ REST_FRAMEWORK = {
         'register': '5/hour',
         'verify': '10/hour',
     },
-    'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
-    'PAGE_SIZE': 50,
+    'DEFAULT_PAGINATION_CLASS': 'config.pagination.ApplicationPagination',
     # Do not expose internal exception details in production.
     'EXCEPTION_HANDLER': 'rest_framework.views.exception_handler',
 }
@@ -315,5 +314,11 @@ if DEPLOYMENT_ENV == 'production':
         raise ImproperlyConfigured('CSRF_COOKIE_SECURE must be enabled in production.')
     if config('CSP_REPORT_ONLY', default=False, cast=bool):
         raise ImproperlyConfigured('CSP_REPORT_ONLY must be False in production.')
+    if not CORS_ALLOWED_ORIGINS or any(
+        origin.startswith('http://') for origin in CORS_ALLOWED_ORIGINS
+    ):
+        raise ImproperlyConfigured(
+            'Production CORS_ALLOWED_ORIGINS must contain only HTTPS origins.'
+        )
     if EMAIL_BACKEND == 'django.core.mail.backends.console.EmailBackend':
         raise ImproperlyConfigured('Production email must use a real delivery backend.')

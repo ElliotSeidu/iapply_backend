@@ -12,6 +12,7 @@ from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
+from rest_framework_simplejwt.token_blacklist.models import OutstandingToken
 from rest_framework_simplejwt.views import TokenObtainPairView
 
 from .models import EmailVerification, User
@@ -225,7 +226,7 @@ class LogoutView(APIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request, *args, **kwargs):
-        serializer = LogoutSerializer(data=request.data)
+        serializer = LogoutSerializer(data=request.data, context={'request': request})
         serializer.is_valid(raise_exception=True)
         serializer.save()
         return Response(
@@ -249,6 +250,14 @@ class ChangePasswordView(APIView):
             )
         user.set_password(serializer.validated_data['new_password'])
         user.save()
+        for token in OutstandingToken.objects.filter(
+            user=user,
+            blacklistedtoken__isnull=True,
+        ):
+            try:
+                RefreshToken(token.token).blacklist()
+            except Exception:
+                continue
         return Response(
             {"message": "Password updated successfully."},
             status=status.HTTP_200_OK,
@@ -267,6 +276,14 @@ class DeleteAccountView(generics.DestroyAPIView):
                 {"message": "Invalid password."},
                 status=status.HTTP_401_UNAUTHORIZED,
             )
+        for token in OutstandingToken.objects.filter(
+            user=user,
+            blacklistedtoken__isnull=True,
+        ):
+            try:
+                RefreshToken(token.token).blacklist()
+            except Exception:
+                continue
         user.delete()
         return Response(
             {"message": "Account deleted successfully."},
