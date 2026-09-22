@@ -1,16 +1,38 @@
+# Environment & Secrets (NEVER COMMIT)
 .env
 .env.*
 !.env.example
+*.pem
+*.key
+
+# Database
 db.sqlite3
 *.sqlite3
+
+# Virtual Environments
 venv/
 .venv/
+env/
+
+# Python Cache
 __pycache__/
 *.py[cod]
-*.log
-staticfiles/
-media/
+*$py.class
+*.so
+
+# Testing & Logs
 .pytest_cache/
 .mypy_cache/
+.coverage
+htmlcov/
+*.log
+
+# Collected Assets & User Uploads
+staticfiles/
+media/
+
+# Editor & System
+.vscode/
 .idea/
 .DS_Store
+Thumbs.db

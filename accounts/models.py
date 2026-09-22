@@ -1,6 +1,7 @@
 from django.db import models
 from django.contrib.auth.models import AbstractBaseUser, PermissionsMixin, BaseUserManager
 
+
 class UserManager(BaseUserManager):
     def create_user(self, email, password=None, **extra_fields):
         if not email:
@@ -30,7 +31,7 @@ class User(AbstractBaseUser, PermissionsMixin):
     is_staff = models.BooleanField(default=False)
     date_joined = models.DateTimeField(auto_now_add=True)
 
-    USERNAME_FIELD= "email"
+    USERNAME_FIELD = "email"
     REQUIRED_FIELDS = []
     objects = UserManager()
 
@@ -39,12 +40,52 @@ class User(AbstractBaseUser, PermissionsMixin):
 
 
 class EmailVerification(models.Model):
+    """
+    Temporary record created when a user initiates registration.
+
+    Security properties:
+    - `code` is generated with `secrets` (CSPRNG) — not `random`.
+    - `attempts` is incremented on every wrong guess; the record is deleted
+      after MAX_ATTEMPTS failures to prevent OTP brute-force.
+    - The entire record is deleted on success or expiry (10 minutes).
+    - `password_hash` stores the Django-hashed password so the plaintext
+      never needs to be stored or re-sent.
+    """
+
+    MAX_ATTEMPTS = 5
+
     email = models.EmailField()
-    code = models.CharField(max_length=10)
-    password_hash = models.CharField(max_length=128)
+    # 256 chars: safely covers pbkdf2_sha256, bcrypt, and argon2 hash lengths.
+    code_hash = models.CharField(max_length=128)
+    password_hash = models.CharField(max_length=256)
     first_name = models.CharField(max_length=150, blank=True)
     last_name = models.CharField(max_length=150, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
+    # Number of incorrect verification attempts made against this record.
+    attempts = models.PositiveSmallIntegerField(default=0)
 
     def __str__(self):
-        return f"Verification for {self.email} ({self.code})"
+        return f"Verification for {self.email} (attempts: {self.attempts})"
+
+
+class PasswordResetRequest(models.Model):
+    """
+    Temporary record for a password-reset OTP flow.
+
+    Security properties:
+    - Token is CSPRNG-generated and stored only as a Django-hashed value.
+    - MAX_ATTEMPTS prevents brute-force; record is deleted after success or expiry.
+    - Expires after 15 minutes (shorter than email verification).
+    - Always responds with the same message to prevent user-enumeration.
+    """
+
+    MAX_ATTEMPTS = 5
+    EXPIRY_MINUTES = 15
+
+    email = models.EmailField()
+    code_hash = models.CharField(max_length=128)
+    created_at = models.DateTimeField(auto_now_add=True)
+    attempts = models.PositiveSmallIntegerField(default=0)
+
+    def __str__(self):
+        return f"PasswordReset for {self.email}"

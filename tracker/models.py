@@ -26,6 +26,17 @@ class Application(models.Model):
         REJECTED = "rejected", "Rejected"
         WITHDRAWN = "withdrawn", "Withdrawn"
 
+    class WorkModel(models.TextChoices):
+        REMOTE = "remote", "Remote"
+        IN_PERSON = "in_person", "In-person"
+        HYBRID = "hybrid", "Hybrid"
+
+    class JobType(models.TextChoices):
+        FULL_TIME = "full_time", "Full-time"
+        PART_TIME = "part_time", "Part-time"
+        CONTRACT = "contract", "Contract"
+        INTERNSHIP = "internship", "Internship"
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     user = models.ForeignKey(
         settings.AUTH_USER_MODEL,
@@ -42,6 +53,10 @@ class Application(models.Model):
         blank=True,
         help_text="e.g. referrer name, job post URL, event name",
     )
+
+    work_model = models.CharField(max_length=20, choices=WorkModel.choices, blank=True, null=True)
+    job_type = models.CharField(max_length=20, choices=JobType.choices, blank=True, null=True)
+    monthly_salary = models.DecimalField(max_digits=10, decimal_places=2, blank=True, null=True)
 
     date_applied = models.DateField(default=timezone.now)
     current_status = models.CharField(

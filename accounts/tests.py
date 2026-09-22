@@ -1,5 +1,7 @@
 from django.test import TestCase
 from django.urls import reverse
+from unittest.mock import patch
+
 from .models import EmailVerification, User
 
 
@@ -28,13 +30,19 @@ class EmailVerificationTests(TestCase):
 			'first_name': 'Verify',
 			'last_name': 'Me',
 		}
-		resp = self.client.post(req_url, data=payload, content_type='application/json')
+		with patch('accounts.views.secrets.randbelow', return_value=123456):
+			resp = self.client.post(req_url, data=payload, content_type='application/json')
 		self.assertEqual(resp.status_code, 200)
 		record = EmailVerification.objects.filter(email='verifyme@example.com').first()
 		self.assertIsNotNone(record)
+		self.assertNotEqual(record.code_hash, '223456')
 		# call verify endpoint
 		verify_url = reverse('register-verify')
-		verify_resp = self.client.post(verify_url, data={'email': 'verifyme@example.com', 'code': record.code}, content_type='application/json')
+		verify_resp = self.client.post(
+			verify_url,
+			data={'email': 'verifyme@example.com', 'code': '223456'},
+			content_type='application/json',
+		)
 		self.assertEqual(verify_resp.status_code, 201)
 		# user should exist and record deleted
 		self.assertTrue(User.objects.filter(email='verifyme@example.com').exists())
