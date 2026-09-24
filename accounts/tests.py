@@ -5,7 +5,7 @@ from rest_framework.test import APIClient
 from rest_framework_simplejwt.token_blacklist.models import BlacklistedToken
 from rest_framework_simplejwt.tokens import RefreshToken
 
-from .models import EmailVerification, User
+from .models import EmailVerification, PasswordResetRequest, User
 
 
 class EmailVerificationTests(TestCase):
@@ -90,3 +90,51 @@ class SessionRevocationTests(TestCase):
 		self.assertTrue(
 			BlacklistedToken.objects.filter(token__token=str(refresh)).exists()
 		)
+
+
+class PasswordResetTests(TestCase):
+	def setUp(self):
+		self.client = APIClient()
+		self.user = User.objects.create_user(
+			email='reset@example.com',
+			password='StrongPassw0rd!',
+		)
+
+	def test_request_sends_code_and_confirm_changes_password(self):
+		with patch('accounts.views.secrets.randbelow', return_value=123456), patch('accounts.views.send_mail'):
+			request_response = self.client.post(
+				reverse('password-reset-request'),
+				data={'email': self.user.email},
+				content_type='application/json',
+			)
+		self.assertEqual(request_response.status_code, 200)
+		self.assertTrue(PasswordResetRequest.objects.filter(email=self.user.email).exists())
+
+		confirm_response = self.client.post(
+			reverse('password-reset-confirm'),
+			data={
+				'email': self.user.email,
+				'code': '223456',
+				'password': 'NewStrongPassw0rd!',
+				'password2': 'NewStrongPassw0rd!',
+			},
+			content_type='application/json',
+		)
+		self.assertEqual(confirm_response.status_code, 200)
+		self.user.refresh_from_db()
+		self.assertTrue(self.user.check_password('NewStrongPassw0rd!'))
+		self.assertFalse(PasswordResetRequest.objects.filter(email=self.user.email).exists())
+
+	def test_unknown_email_returns_generic_response(self):
+		with patch('accounts.views.send_mail') as send_mail:
+			response = self.client.post(
+				reverse('password-reset-request'),
+				data={'email': 'unknown@example.com'},
+				content_type='application/json',
+			)
+		self.assertEqual(response.status_code, 200)
+		self.assertEqual(
+			response.data['message'],
+			"If an account exists for that email, a reset code has been sent.",
+		)
+		send_mail.assert_not_called()

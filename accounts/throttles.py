@@ -36,3 +36,8 @@ class VerifyRateThrottle(AnonRateThrottle):
     in long before that.
     """
     scope = 'verify'
+
+
+class PasswordResetRateThrottle(AnonRateThrottle):
+    """5 password-reset requests per IP per hour."""
+    scope = 'password_reset'

@@ -15,17 +15,24 @@ from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.token_blacklist.models import OutstandingToken
 from rest_framework_simplejwt.views import TokenObtainPairView
 
-from .models import EmailVerification, User
+from .models import EmailVerification, PasswordResetRequest, User
 from .serializers import (
     ChangePasswordSerializer,
     DeleteAccountSerializer,
     LogoutSerializer,
     MyTokenObtainPairSerializer,
+    PasswordResetConfirmSerializer,
+    PasswordResetRequestSerializer,
     UserSerializer,
     VerificationConfirmSerializer,
     VerificationRequestSerializer,
 )
-from .throttles import LoginRateThrottle, RegisterRateThrottle, VerifyRateThrottle
+from .throttles import (
+    LoginRateThrottle,
+    PasswordResetRateThrottle,
+    RegisterRateThrottle,
+    VerifyRateThrottle,
+)
 
 
 class RegistrationView(APIView):
@@ -200,6 +207,108 @@ class MyTokenObtainPairView(TokenObtainPairView):
 
     serializer_class = MyTokenObtainPairSerializer
     throttle_classes = [LoginRateThrottle]
+
+
+class PasswordResetRequestView(APIView):
+    permission_classes = [AllowAny]
+    throttle_classes = [PasswordResetRateThrottle]
+
+    def post(self, request, *args, **kwargs):
+        serializer = PasswordResetRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        email = serializer.validated_data['email'].strip().lower()
+        user = User.objects.filter(email__iexact=email, is_active=True).first()
+
+        if user:
+            PasswordResetRequest.objects.filter(email=email).delete()
+            code = str(secrets.randbelow(900000) + 100000)
+            PasswordResetRequest.objects.create(
+                email=email,
+                code_hash=make_password(code),
+            )
+            send_mail(
+                subject='Your iApply password reset code',
+                message=(
+                    f'Your iApply password reset code is: {code}\n\n'
+                    'This code expires in 15 minutes. If you did not request this, '
+                    'you can safely ignore this email.'
+                ),
+                from_email=getattr(settings, 'DEFAULT_FROM_EMAIL', None),
+                recipient_list=[email],
+                fail_silently=True,
+            )
+
+        return Response(
+            {"message": "If an account exists for that email, a reset code has been sent."},
+            status=status.HTTP_200_OK,
+        )
+
+
+class PasswordResetConfirmView(APIView):
+    permission_classes = [AllowAny]
+    throttle_classes = [VerifyRateThrottle]
+
+    def post(self, request, *args, **kwargs):
+        serializer = PasswordResetConfirmSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        email = serializer.validated_data['email'].strip().lower()
+
+        with transaction.atomic():
+            record = (
+                PasswordResetRequest.objects
+                .select_for_update()
+                .filter(email=email)
+                .order_by('-created_at')
+                .first()
+            )
+
+            if not record:
+                return Response(
+                    {"message": "Invalid or expired code. Please request a new one."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if timezone.now() > record.created_at + timedelta(minutes=PasswordResetRequest.EXPIRY_MINUTES):
+                record.delete()
+                return Response(
+                    {"message": "Code has expired. Please request a new one."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if record.attempts >= PasswordResetRequest.MAX_ATTEMPTS:
+                record.delete()
+                return Response(
+                    {"message": "Too many incorrect attempts. Please request a new code."},
+                    status=status.HTTP_429_TOO_MANY_REQUESTS,
+                )
+            if not check_password(serializer.validated_data['code'], record.code_hash):
+                record.attempts += 1
+                record.save(update_fields=['attempts'])
+                remaining = PasswordResetRequest.MAX_ATTEMPTS - record.attempts
+                return Response(
+                    {"message": f"Incorrect code. {remaining} attempt(s) remaining."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            user = User.objects.filter(email__iexact=email, is_active=True).first()
+            if not user:
+                record.delete()
+                return Response(
+                    {"message": "Invalid or expired code. Please request a new one."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            user.set_password(serializer.validated_data['password'])
+            user.save(update_fields=['password'])
+            record.delete()
+
+        for token in OutstandingToken.objects.filter(
+            user=user,
+            blacklistedtoken__isnull=True,
+        ):
+            try:
+                RefreshToken(token.token).blacklist()
+            except Exception:
+                continue
+
+        return Response({"message": "Password reset successfully."}, status=status.HTTP_200_OK)
 
 
 class MeView(generics.RetrieveAPIView):

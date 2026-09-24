@@ -199,6 +199,7 @@ REST_FRAMEWORK = {
         'login': '10/hour',
         'register': '5/hour',
         'verify': '10/hour',
+        'password_reset': '5/hour',
     },
     'DEFAULT_PAGINATION_CLASS': 'config.pagination.ApplicationPagination',
     # Do not expose internal exception details in production.
