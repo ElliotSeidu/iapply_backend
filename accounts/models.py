@@ -54,9 +54,9 @@ class EmailVerification(models.Model):
 
     MAX_ATTEMPTS = 5
 
-    email = models.EmailField()
+    email = models.EmailField(db_index=True)
     # 256 chars: safely covers pbkdf2_sha256, bcrypt, and argon2 hash lengths.
-    code_hash = models.CharField(max_length=128)
+    code_hash = models.CharField(max_length=256)
     password_hash = models.CharField(max_length=256)
     first_name = models.CharField(max_length=150, blank=True)
     last_name = models.CharField(max_length=150, blank=True)
@@ -82,8 +82,8 @@ class PasswordResetRequest(models.Model):
     MAX_ATTEMPTS = 5
     EXPIRY_MINUTES = 15
 
-    email = models.EmailField()
-    code_hash = models.CharField(max_length=128)
+    email = models.EmailField(db_index=True)
+    code_hash = models.CharField(max_length=256)
     created_at = models.DateTimeField(auto_now_add=True)
     attempts = models.PositiveSmallIntegerField(default=0)
 

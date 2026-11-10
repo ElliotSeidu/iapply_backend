@@ -15,10 +15,12 @@ from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.token_blacklist.models import OutstandingToken
 from rest_framework_simplejwt.views import TokenObtainPairView
 
+from .google_auth import GoogleAuthError, split_google_name, verify_google_id_token
 from .models import EmailVerification, PasswordResetRequest, User
 from .serializers import (
     ChangePasswordSerializer,
     DeleteAccountSerializer,
+    GoogleLoginSerializer,
     LogoutSerializer,
     MyTokenObtainPairSerializer,
     PasswordResetConfirmSerializer,
@@ -28,6 +30,7 @@ from .serializers import (
     VerificationRequestSerializer,
 )
 from .throttles import (
+    GoogleLoginRateThrottle,
     LoginRateThrottle,
     PasswordResetRateThrottle,
     RegisterRateThrottle,
@@ -54,10 +57,23 @@ class RegistrationView(APIView):
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
         email = data['email'].strip().lower()
+        is_dev_console = (
+            getattr(settings, 'DEBUG', False)
+            and getattr(settings, 'DEPLOYMENT_ENV', 'development') != 'production'
+            and getattr(settings, 'EMAIL_BACKEND', '') == 'django.core.mail.backends.console.EmailBackend'
+        )
 
         # Always return the same response whether or not the email is already
         # registered — avoids leaking which emails exist (user enumeration).
         if User.objects.filter(email__iexact=email).exists():
+            if is_dev_console:
+                print(
+                    f"\n{'=' * 64}\n"
+                    f"  [iApply DEV NOTE] Registration skipped for {email}\n"
+                    f"  Reason: Account already exists. Log in or reset password instead.\n"
+                    f"{'=' * 64}\n",
+                    flush=True,
+                )
             return Response(
                 {"message": "Verification code sent to email"},
                 status=status.HTTP_200_OK,
@@ -77,6 +93,15 @@ class RegistrationView(APIView):
             first_name=data.get('first_name', ''),
             last_name=data.get('last_name', ''),
         )
+        if is_dev_console:
+            print(
+                f"\n{'=' * 64}\n"
+                f"  [iApply OTP] Email Verification\n"
+                f"  To:   {email}\n"
+                f"  Code: {code}\n"
+                f"{'=' * 64}\n",
+                flush=True,
+            )
         send_mail(
             subject='Your iApply verification code',
             message=(
@@ -226,6 +251,20 @@ class PasswordResetRequestView(APIView):
                 email=email,
                 code_hash=make_password(code),
             )
+            is_dev_console = (
+                getattr(settings, 'DEBUG', False)
+                and getattr(settings, 'DEPLOYMENT_ENV', 'development') != 'production'
+                and getattr(settings, 'EMAIL_BACKEND', '') == 'django.core.mail.backends.console.EmailBackend'
+            )
+            if is_dev_console:
+                print(
+                    f"\n{'=' * 64}\n"
+                    f"  [iApply OTP] Password Reset Code\n"
+                    f"  To:   {email}\n"
+                    f"  Code: {code}\n"
+                    f"{'=' * 64}\n",
+                    flush=True,
+                )
             send_mail(
                 subject='Your iApply password reset code',
                 message=(
@@ -351,6 +390,15 @@ class ChangePasswordView(APIView):
         serializer = ChangePasswordSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         user = request.user
+        # Google-only accounts have an unusable password (set_unusable_password).
+        # They cannot change their password via this endpoint — they must use the
+        # forgot-password flow to set a password first.
+        if not user.has_usable_password():
+            return Response(
+                {"message": "Your account uses Google Sign-In and has no password set. "
+                             "Use the Forgot Password flow to set one first."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
         if not user.check_password(serializer.validated_data['old_password']):
             # Generic message — do not hint whether the account exists.
             return Response(
@@ -380,11 +428,15 @@ class DeleteAccountView(generics.DestroyAPIView):
         serializer = DeleteAccountSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         user = request.user
-        if not user.check_password(serializer.validated_data['password']):
-            return Response(
-                {"message": "Invalid password."},
-                status=status.HTTP_401_UNAUTHORIZED,
-            )
+        # Google-only accounts have an unusable password; skip the password check.
+        # The user is already authenticated with a valid JWT, which is sufficient
+        # proof of identity for account deletion in this case.
+        if user.has_usable_password():
+            if not user.check_password(serializer.validated_data['password']):
+                return Response(
+                    {"message": "Invalid password."},
+                    status=status.HTTP_401_UNAUTHORIZED,
+                )
         for token in OutstandingToken.objects.filter(
             user=user,
             blacklistedtoken__isnull=True,
@@ -396,5 +448,94 @@ class DeleteAccountView(generics.DestroyAPIView):
         user.delete()
         return Response(
             {"message": "Account deleted successfully."},
+            status=status.HTTP_200_OK,
+        )
+
+
+class GoogleLoginView(APIView):
+    """
+    Sign in (or sign up) with a Google account.
+
+    Security notes:
+    - The ID token is verified server-side against Google's public keys with the
+      audience pinned to GOOGLE_CLIENT_ID; no client-supplied email is trusted.
+    - `email_verified` must be true. Without that check an unverified Google
+      address could be used to take over an existing account.
+    - Accounts are matched on email, so someone who registered with a password
+      can later use Google with the same (now Google-verified) address.
+    - Rate-limited to 10 attempts per IP per hour.
+    - Every credential failure returns one generic message, so the endpoint
+      cannot be used to probe which emails or Google accounts exist.
+    """
+
+    permission_classes = [AllowAny]
+    throttle_classes = [GoogleLoginRateThrottle]
+    authentication_classes = []
+
+    def post(self, request, *args, **kwargs):
+        serializer = GoogleLoginSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        try:
+            info = verify_google_id_token(serializer.validated_data['credential'])
+        except GoogleAuthError as exc:
+            # A missing GOOGLE_CLIENT_ID / google-auth install is a *server*
+            # problem, not a bad credential, so report it distinctly (503) and
+            # let it fail loudly in ops instead of looking like a user error.
+            if 'not configured' in str(exc) or 'missing the google-auth' in str(exc):
+                return Response(
+                    {'message': 'Google sign-in is not available right now.'},
+                    status=status.HTTP_503_SERVICE_UNAVAILABLE,
+                )
+            return Response(
+                {'message': 'Could not verify that Google account. Please try again.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        email = info['email']
+        first_name, last_name = split_google_name(info)
+
+        with transaction.atomic():
+            user = User.objects.filter(email__iexact=email).first()
+            created = False
+
+            if user is None:
+                # set_unusable_password(): Google-only until the user explicitly
+                # sets a password, so the account can never be entered with a
+                # blank or guessed password.
+                user = User(
+                    email=email,
+                    first_name=first_name[:150],
+                    last_name=last_name[:150],
+                )
+                user.set_unusable_password()
+                user.save()
+                created = True
+
+            # A Google-verified address proves ownership, so any half-finished
+            # email-verification record for it is now redundant.
+            EmailVerification.objects.filter(email__iexact=email).delete()
+
+        if not user.is_active:
+            # Same generic message as an invalid token — do not reveal that the
+            # account exists but is disabled.
+            return Response(
+                {'message': 'Could not verify that Google account. Please try again.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # Same response shape as /account/login/ so the frontend can reuse a
+        # single code path for both sign-in methods.
+        refresh = RefreshToken.for_user(user)
+        return Response(
+            {
+                'access': str(refresh.access_token),
+                'refresh': str(refresh),
+                'email': user.email,
+                'first_name': user.first_name,
+                'last_name': user.last_name,
+                'id': str(user.id),
+                'created': created,
+            },
             status=status.HTTP_200_OK,
         )

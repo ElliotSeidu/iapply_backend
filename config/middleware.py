@@ -21,27 +21,20 @@ class SecurityHeadersMiddleware:
         # Content-Security-Policy header
         # Prevents XSS, frame injection, and restricted asset loads
         csp_directives = [
-            "default-src 'self'",
+            "default-src 'none'",
             "img-src 'self' data: https:",
             "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
             "font-src 'self' https://fonts.gstatic.com data:",
             "script-src 'self'",
-            "connect-src 'self' http://localhost:* http://127.0.0.1:* https:",
+            "connect-src 'self'",
             "frame-ancestors 'none'",
-            "base-uri 'self'",
+            "base-uri 'none'",
             "form-action 'self'",
         ]
         csp_header_value = "; ".join(csp_directives)
 
-        # In report-only mode during testing/dev, otherwise enforce
-        csp_header_name = (
-            "Content-Security-Policy-Report-Only"
-            if getattr(settings, "CSP_REPORT_ONLY", True)
-            else "Content-Security-Policy"
-        )
-
-        if csp_header_name not in response:
-            response[csp_header_name] = csp_header_value
+        if "Content-Security-Policy" not in response:
+            response["Content-Security-Policy"] = csp_header_value
 
         # Permissions-Policy to disable unnecessary browser APIs (camera, mic, geolocation)
         if "Permissions-Policy" not in response:

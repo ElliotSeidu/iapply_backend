@@ -1,4 +1,5 @@
 from rest_framework import serializers
+from datetime import date, timedelta
 
 from .models import Application, Reminder, StatusEvent
 
@@ -22,6 +23,16 @@ class ReminderSerializer(serializers.ModelSerializer):
             "is_auto_generated",
         ]
         read_only_fields = ["id", "is_auto_generated"]
+
+    def validate_remind_at(self, value):
+        """Reject reminders set more than 2 years in the future."""
+        max_future = date.today() + timedelta(days=730)
+        remind_date = value.date() if hasattr(value, 'date') else value
+        if remind_date > max_future:
+            raise serializers.ValidationError(
+                "Reminder date cannot be more than 2 years in the future."
+            )
+        return value
 
 
 class ApplicationSerializer(serializers.ModelSerializer):
@@ -58,6 +69,24 @@ class ApplicationSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         ]
+
+    def validate_date_applied(self, value):
+        """
+        Reject obviously bogus dates:
+        - Future dates (you cannot have applied for a job tomorrow).
+        - Dates more than 50 years in the past (data-entry error guard).
+        """
+        today = date.today()
+        if value > today:
+            raise serializers.ValidationError(
+                "Date applied cannot be in the future."
+            )
+        earliest_allowed = today.replace(year=today.year - 50)
+        if value < earliest_allowed:
+            raise serializers.ValidationError(
+                "Date applied is too far in the past. Please check the date."
+            )
+        return value
 
     def get_days_since_applied(self, obj):
         return obj.days_since_applied()

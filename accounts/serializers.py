@@ -4,8 +4,10 @@ from django.contrib.auth.password_validation import validate_password
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 from rest_framework_simplejwt.tokens import RefreshToken
 
+
 class RegistrationSerializer(serializers.ModelSerializer):
     password2 = serializers.CharField(write_only=True)
+
     def validate(self, attrs):
         if attrs['password'] != attrs['password2']:
             raise serializers.ValidationError({"password2": "The passwords don't match"})
@@ -40,7 +42,12 @@ class VerificationRequestSerializer(serializers.Serializer):
 
 class VerificationConfirmSerializer(serializers.Serializer):
     email = serializers.EmailField()
-    code = serializers.CharField()
+    # Strictly require exactly 6 digits -- rejects oversized payloads and
+    # non-numeric strings before we even hit the DB / password hash call.
+    code = serializers.RegexField(
+        regex=r'^\d{6}$',
+        error_messages={'invalid': 'Enter the 6-digit code from your email.'},
+    )
 
 
 class PasswordResetRequestSerializer(serializers.Serializer):
@@ -49,7 +56,12 @@ class PasswordResetRequestSerializer(serializers.Serializer):
 
 class PasswordResetConfirmSerializer(serializers.Serializer):
     email = serializers.EmailField()
-    code = serializers.CharField()
+    # Strictly require exactly 6 digits -- rejects oversized payloads and
+    # non-numeric strings before we even hit the DB / password hash call.
+    code = serializers.RegexField(
+        regex=r'^\d{6}$',
+        error_messages={'invalid': 'Enter the 6-digit code from your email.'},
+    )
     password = serializers.CharField(write_only=True)
     password2 = serializers.CharField(write_only=True)
 
@@ -71,9 +83,21 @@ class MyTokenObtainPairSerializer(TokenObtainPairSerializer):
 
 
 class UserSerializer(serializers.ModelSerializer):
+    # Tells the frontend whether the user has a usable password set.
+    # Google-only accounts (created via set_unusable_password) return False,
+    # which lets the UI adapt the Change Password section accordingly.
+    has_password = serializers.SerializerMethodField(read_only=True)
+
+    def get_has_password(self, obj):
+        return obj.has_usable_password()
+
     class Meta:
         model = User
-        fields = ["id", "email", "first_name", "last_name", "date_joined"]
+        fields = ["id", "email", "first_name", "last_name", "date_joined", "has_password"]
+        # email is the login identifier and recovery channel -- never let a
+        # PATCH request change it. Doing so would allow a stolen 15-minute
+        # access token to permanently hijack an account via password reset.
+        read_only_fields = ["id", "email", "date_joined", "has_password"]
 
 
 class LogoutSerializer(serializers.Serializer):
@@ -110,4 +134,25 @@ class ChangePasswordSerializer(serializers.Serializer):
 
 
 class DeleteAccountSerializer(serializers.Serializer):
-    password = serializers.CharField(write_only=True)
+    # Optional so Google-only accounts (no usable password) can delete their
+    # account. The view still enforces the password for password accounts.
+    password = serializers.CharField(write_only=True, required=False, allow_blank=True, default='')
+
+
+class GoogleLoginSerializer(serializers.Serializer):
+    """
+    Accepts the Google Identity Services ID token (a signed JWT).
+
+    The token is the *only* input we trust: email and name are read from the
+    signature-verified token claims server-side, never from the request body, so
+    a client cannot assert an identity it does not own.
+    """
+
+    credential = serializers.CharField(
+        write_only=True,
+        trim_whitespace=True,
+        error_messages={
+            'blank': 'A Google credential is required.',
+            'required': 'A Google credential is required.',
+        },
+    )

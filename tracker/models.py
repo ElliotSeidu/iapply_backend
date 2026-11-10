@@ -72,6 +72,7 @@ class Application(models.Model):
     class Meta:
         ordering = ["-date_applied"]
         indexes = [
+            models.Index(fields=["user", "-date_applied"]),
             models.Index(fields=["user", "current_status"]),
             models.Index(fields=["user", "channel"]),
         ]

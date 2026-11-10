@@ -41,3 +41,13 @@ class VerifyRateThrottle(AnonRateThrottle):
 class PasswordResetRateThrottle(AnonRateThrottle):
     """5 password-reset requests per IP per hour."""
     scope = 'password_reset'
+
+
+class GoogleLoginRateThrottle(AnonRateThrottle):
+    """
+    10 Google sign-in attempts per IP per hour.
+
+    Each attempt forces a network round-trip to Google's public-key endpoint, so
+    this also stops the endpoint being used as an outbound-request amplifier.
+    """
+    scope = 'google_login'

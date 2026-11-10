@@ -1,4 +1,4 @@
-from django.db.models import Avg, Count, Q
+from django.db.models import Avg, Count, ExpressionWrapper, F, OuterRef, Q, Subquery, fields
 from django.utils import timezone
 from rest_framework import viewsets, status, permissions
 from rest_framework.decorators import action
@@ -94,17 +94,17 @@ class ReminderViewSet(viewsets.ModelViewSet):
 
 
 class AnalyticsView(APIView):
-    """Computed, read-only insights — not a CRUD resource."""
+    """Computed, read-only insights — not a CRUD resource.
+
+    All aggregations are done in the database.  No application objects are
+    loaded into Python memory, so the view scales to any dataset size.
+    """
 
     permission_classes = [permissions.IsAuthenticated]
 
     def get(self, request):
-        applications = (
-            Application.objects
-            .filter(user=request.user)
-            .prefetch_related('status_events')
-        )
-        total = applications.count()
+        base_qs = Application.objects.filter(user=request.user)
+        total = base_qs.count()
 
         if total == 0:
             return Response({
@@ -115,55 +115,83 @@ class AnalyticsView(APIView):
                 "stale_count": 0,
             })
 
-        # Status breakdown — single GROUP BY query
+        # ── Status breakdown: single GROUP BY query ──────────────────────────
         status_breakdown = dict(
-            applications.values_list("current_status")
+            base_qs.values_list("current_status")
             .annotate(count=Count("id"))
             .values_list("current_status", "count")
         )
 
-        # Channel performance
+        # ── Channel performance: single GROUP BY query ───────────────────────
+        channel_stats = base_qs.values("channel").annotate(
+            total=Count("id"),
+            responded=Count("id", filter=~Q(current_status=Application.Status.APPLIED))
+        )
+
         channel_performance = []
-        for channel_value, channel_label in Application.Channel.choices:
-            channel_apps = applications.filter(channel=channel_value)
-            channel_total = channel_apps.count()
-            if channel_total == 0:
+        channel_choices_dict = dict(Application.Channel.choices)
+
+        for stat in channel_stats:
+            channel_value = stat["channel"]
+            channel_label = channel_choices_dict.get(channel_value, channel_value)
+            ch_total = stat["total"]
+            responded = stat["responded"]
+            if ch_total == 0:
                 continue
-            responded = channel_apps.exclude(
-                current_status=Application.Status.APPLIED
-            ).count()
             channel_performance.append({
                 "channel": channel_value,
                 "label": channel_label,
-                "total_applications": channel_total,
-                "response_rate": round(responded / channel_total * 100, 1),
+                "total_applications": ch_total,
+                "response_rate": round(responded / ch_total * 100, 1),
             })
         channel_performance.sort(key=lambda c: c["response_rate"], reverse=True)
 
-        # Average days to first response
-        response_gaps = []
-        for app in applications:
-            events = list(app.status_events.all())
-            if len(events) < 2:
-                continue
-            first_response = events[1]
-            gap = (first_response.occurred_at.date() - app.date_applied).days
-            if gap >= 0:
-                response_gaps.append(gap)
+        # ── Average days to first response: fully DB-side ────────────────────
+        #
+        # For each application, the "first response" is the earliest status
+        # event that is NOT the initial "applied" entry. (Using "the second
+        # event by time" is wrong when users backdate a status change, because
+        # the auto-created "applied" event is stamped with the row creation time.)
+        # A correlated Subquery fetches only that one timestamp per application,
+        # and Avg runs in the database -- O(1) Python memory at any data size.
 
-        avg_days_to_first_response = (
-            round(sum(response_gaps) / len(response_gaps), 1)
-            if response_gaps else None
+        second_event_subquery = (
+            StatusEvent.objects
+            .filter(application=OuterRef("pk"))
+            .exclude(status=Application.Status.APPLIED)
+            .order_by("occurred_at")
+            .values("occurred_at")[:1]
         )
 
-        # Stale count — DB-side filter is O(1) instead of a Python loop
+        avg_result = (
+            base_qs
+            .annotate(second_event_at=Subquery(second_event_subquery))
+            .filter(second_event_at__isnull=False)   # only apps with a response
+            .annotate(
+                days_gap=ExpressionWrapper(
+                    F("second_event_at__date") - F("date_applied"),
+                    output_field=fields.DurationField(),
+                )
+            )
+            .filter(days_gap__gte=timezone.timedelta(0))  # ignore negative gaps
+            .aggregate(avg_gap=Avg("days_gap"))
+        )
+
+        raw_avg = avg_result["avg_gap"]
+        if raw_avg is not None:
+            # DurationField Avg returns a timedelta; extract total seconds → days
+            avg_days_to_first_response = round(raw_avg.total_seconds() / 86400, 1)
+        else:
+            avg_days_to_first_response = None
+
+        # ── Stale count: DB-side filter ──────────────────────────────────────
         active_statuses = [
             Application.Status.APPLIED,
             Application.Status.OA,
             Application.Status.INTERVIEW,
         ]
         stale_threshold = timezone.now().date() - timezone.timedelta(days=21)
-        stale_count = applications.filter(
+        stale_count = base_qs.filter(
             current_status__in=active_statuses,
             date_applied__lte=stale_threshold,
         ).count()
