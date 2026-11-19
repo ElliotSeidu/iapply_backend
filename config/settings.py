@@ -1,6 +1,7 @@
 from datetime import timedelta
 from pathlib import Path
 
+from django.core import checks
 from django.core.exceptions import ImproperlyConfigured
 from decouple import Csv, config
 
@@ -15,13 +16,21 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 SECRET_KEY = config('SECRET_KEY', default='')
 DEBUG = config('DEBUG', default=False, cast=bool)
 # Default to production to ensure secure defaults (fail-closed).
-DEPLOYMENT_ENV = config('DEPLOYMENT_ENV', default='production').lower()
+ALLOWED_DEPLOYMENT_ENVS = {'development', 'test', 'staging', 'production'}
+DEPLOYMENT_ENV = config('DEPLOYMENT_ENV', default='production').strip().lower()
+if DEPLOYMENT_ENV not in ALLOWED_DEPLOYMENT_ENVS:
+    raise ImproperlyConfigured(
+        f'DEPLOYMENT_ENV must be one of {sorted(ALLOWED_DEPLOYMENT_ENVS)}.'
+    )
 
 if not SECRET_KEY or SECRET_KEY == 'change-me-to-a-long-random-string':
     raise ImproperlyConfigured('SECRET_KEY must be set to a unique random value.')
 
-if DEPLOYMENT_ENV == 'production' and DEBUG:
-    raise ImproperlyConfigured('DEBUG must be False in production.')
+if DEPLOYMENT_ENV == 'production':
+    if DEBUG:
+        raise ImproperlyConfigured('DEBUG must be False in production.')
+    if len(SECRET_KEY) < 50:
+        raise ImproperlyConfigured('SECRET_KEY must be at least 50 characters in production.')
 
 ALLOWED_HOSTS = config(
     'ALLOWED_HOSTS',
@@ -55,9 +64,9 @@ CORS_ALLOW_CREDENTIALS = False  # We use Bearer tokens, not cookies for API.
 SECURE_SSL_REDIRECT = config('SECURE_SSL_REDIRECT', default=not DEBUG, cast=bool)
 SESSION_COOKIE_SECURE = config('SESSION_COOKIE_SECURE', default=not DEBUG, cast=bool)
 CSRF_COOKIE_SECURE = config('CSRF_COOKIE_SECURE', default=not DEBUG, cast=bool)
-# Only trust the X-Forwarded-Proto header when we know we are sitting behind
-# a reverse proxy (i.e. not in debug mode directly exposed to the internet).
-if not DEBUG:
+# Only trust the X-Forwarded-Proto header when explicitly enabled behind a reverse proxy.
+TRUST_PROXY_SSL_HEADER = config('TRUST_PROXY_SSL_HEADER', default=not DEBUG, cast=bool)
+if not DEBUG and TRUST_PROXY_SSL_HEADER:
     SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
 USE_X_FORWARDED_HOST = config('USE_X_FORWARDED_HOST', default=False, cast=bool)
 
@@ -137,10 +146,16 @@ WSGI_APPLICATION = 'config.wsgi.application'
 # Security Settings
 # ──────────────────────────────────────────────────────────────────────────────
 # CSP is implemented via our custom middleware in config.middleware.py
+CSP_REPORT_ONLY = config('CSP_REPORT_ONLY', default=False, cast=bool)
 # ──────────────────────────────────────────────────────────────────────────────
 
 # Referrer-Policy — only send the origin, not the full path, when crossing origins.
 SECURE_REFERRER_POLICY = 'strict-origin-when-cross-origin'
+SESSION_COOKIE_HTTPONLY = True
+SESSION_COOKIE_SAMESITE = 'Lax'
+CSRF_COOKIE_SAMESITE = 'Lax'
+# Allow Google Identity Services sign-in popups to communicate cleanly.
+SECURE_CROSS_ORIGIN_OPENER_POLICY = 'same-origin-allow-popups'
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -185,14 +200,20 @@ REST_FRAMEWORK = {
         'verify': '10/hour',
         'password_reset': '5/hour',
         'google_login': '10/hour',
+        'token_refresh': '30/hour',
+        'password_action': '10/hour',
     },
     'DEFAULT_PAGINATION_CLASS': 'config.pagination.ApplicationPagination',
     # Do not expose internal exception details in production.
     'EXCEPTION_HANDLER': 'rest_framework.views.exception_handler',
-    # B3 Fix: Tell DRF we are behind 1 proxy (e.g. nginx/Cloud Run) so it correctly
-    # uses the last IP in X-Forwarded-For for rate limiting instead of trusting the whole chain.
-    'NUM_PROXIES': 1 if not DEBUG else None,
+    # In dev/test default to 0 so client-forged X-Forwarded-For headers are ignored;
+    # behind a single reverse proxy (e.g. nginx/Cloud Run) defaults to 1.
+    'NUM_PROXIES': config('NUM_PROXIES', default=1 if not DEBUG else 0, cast=int),
 }
+if not DEBUG:
+    REST_FRAMEWORK['DEFAULT_RENDERER_CLASSES'] = (
+        'rest_framework.renderers.JSONRenderer',
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -209,14 +230,41 @@ STORAGES = {
     },
 }
 
-# B3 Fix: Throttling requires a cache. We use LocMemCache here, but in a multi-worker
-# production environment you should use RedisCache.
-CACHES = {
-    "default": {
-        "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
-        "LOCATION": "unique-iapply-cache",
+# Configurable throttle cache: use Redis in multi-worker production (REDIS_URL),
+# falling back safely to LocMemCache for local development/testing.
+REDIS_URL = config('REDIS_URL', default='').strip()
+if REDIS_URL:
+    CACHES = {
+        "default": {
+            "BACKEND": "django.core.cache.backends.redis.RedisCache",
+            "LOCATION": REDIS_URL,
+            "KEY_PREFIX": "iapply",
+        }
     }
-}
+else:
+    CACHES = {
+        "default": {
+            "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+            "LOCATION": "unique-iapply-cache",
+        }
+    }
+
+
+@checks.register(checks.Tags.security, deploy=True)
+def check_shared_throttle_cache(app_configs, **kwargs):
+    if DEPLOYMENT_ENV == 'production' and not REDIS_URL:
+        return [
+            checks.Warning(
+                'REDIS_URL is not configured in production.',
+                hint=(
+                    'Set REDIS_URL (e.g. redis://...) so DRF throttles, per-email '
+                    'rate limits, and Google ID-token replay protection are shared '
+                    'across Gunicorn workers.'
+                ),
+                id='iapply.W001',
+            )
+        ]
+    return []
 
 # H9 Fix: Add basic logging to capture 500 errors in production.
 LOGGING = {
@@ -375,19 +423,30 @@ EMAIL_PORT = config('EMAIL_PORT', default=587, cast=int)
 EMAIL_USE_TLS = config('EMAIL_USE_TLS', default=True, cast=bool)
 EMAIL_HOST_USER = config('EMAIL_HOST_USER', default='')
 EMAIL_HOST_PASSWORD = config('EMAIL_HOST_PASSWORD', default='')
+EMAIL_TIMEOUT = config('EMAIL_TIMEOUT', default=10, cast=int)
+
+ADMIN_URL = config('ADMIN_URL', default='admin/').strip().lstrip('/')
+if ADMIN_URL and not ADMIN_URL.endswith('/'):
+    ADMIN_URL += '/'
+
+_DISALLOWED_PROD_EMAIL_BACKENDS = {
+    'django.core.mail.backends.console.EmailBackend',
+    'django.core.mail.backends.locmem.EmailBackend',
+    'django.core.mail.backends.dummy.EmailBackend',
+}
 
 if DEPLOYMENT_ENV == 'production':
     if DB_ENGINE != 'postgres':
         raise ImproperlyConfigured('Production deployments must use PostgreSQL.')
     if config('DB_SSLMODE', default='require') not in {'require', 'verify-ca', 'verify-full'}:
         raise ImproperlyConfigured('Production database connections must use TLS.')
-    if config('SECURE_SSL_REDIRECT', default=True, cast=bool) is False:
+    if not SECURE_SSL_REDIRECT:
         raise ImproperlyConfigured('SECURE_SSL_REDIRECT must be enabled in production.')
-    if not config('SESSION_COOKIE_SECURE', default=True, cast=bool):
+    if not SESSION_COOKIE_SECURE:
         raise ImproperlyConfigured('SESSION_COOKIE_SECURE must be enabled in production.')
-    if not config('CSRF_COOKIE_SECURE', default=True, cast=bool):
+    if not CSRF_COOKIE_SECURE:
         raise ImproperlyConfigured('CSRF_COOKIE_SECURE must be enabled in production.')
-    if config('CSP_REPORT_ONLY', default=False, cast=bool):
+    if CSP_REPORT_ONLY:
         raise ImproperlyConfigured('CSP_REPORT_ONLY must be False in production.')
     if not CORS_ALLOWED_ORIGINS or any(
         origin.startswith('http://') for origin in CORS_ALLOWED_ORIGINS
@@ -395,5 +454,5 @@ if DEPLOYMENT_ENV == 'production':
         raise ImproperlyConfigured(
             'Production CORS_ALLOWED_ORIGINS must contain only HTTPS origins.'
         )
-    if EMAIL_BACKEND == 'django.core.mail.backends.console.EmailBackend':
+    if EMAIL_BACKEND in _DISALLOWED_PROD_EMAIL_BACKENDS:
         raise ImproperlyConfigured('Production email must use a real delivery backend.')

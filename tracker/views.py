@@ -53,23 +53,6 @@ class ApplicationViewSet(viewsets.ModelViewSet):
             StatusEventSerializer(event).data, status=status.HTTP_201_CREATED
         )
 
-    @action(detail=False, methods=["get"], url_path="stale")
-    def stale(self, request):
-        """Applications sitting with no movement past the threshold —
-        drives the follow-up nudge feature."""
-        active_statuses = [
-            Application.Status.APPLIED,
-            Application.Status.OA,
-            Application.Status.INTERVIEW,
-        ]
-        stale_threshold = timezone.now().date() - timezone.timedelta(days=21)
-        queryset = self.get_queryset().filter(
-            current_status__in=active_statuses,
-            date_applied__lte=stale_threshold,
-        )
-        serializer = self.get_serializer(queryset, many=True)
-        return Response(serializer.data)
-
 
 class ReminderViewSet(viewsets.ModelViewSet):
     serializer_class = ReminderSerializer
@@ -186,7 +169,7 @@ class AnalyticsView(APIView):
             Application.Status.OA,
             Application.Status.INTERVIEW,
         ]
-        stale_threshold = timezone.now().date() - timezone.timedelta(days=21)
+        stale_threshold = timezone.localdate() - timezone.timedelta(days=21)
         stale_count = base_qs.filter(
             current_status__in=active_statuses,
             date_applied__lte=stale_threshold,

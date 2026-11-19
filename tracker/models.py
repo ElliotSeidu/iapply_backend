@@ -58,7 +58,7 @@ class Application(models.Model):
     job_type = models.CharField(max_length=20, choices=JobType.choices, blank=True, null=True)
     monthly_salary = models.DecimalField(max_digits=10, decimal_places=2, blank=True, null=True)
 
-    date_applied = models.DateField(default=timezone.now)
+    date_applied = models.DateField(default=timezone.localdate)
     current_status = models.CharField(
         max_length=20, choices=Status.choices, default=Status.APPLIED
     )
@@ -81,7 +81,7 @@ class Application(models.Model):
         return f"{self.role_title} @ {self.company_name}"
 
     def days_since_applied(self):
-        return (timezone.now().date() - self.date_applied).days
+        return (timezone.localdate() - self.date_applied).days
 
     def is_stale(self, threshold_days=21):
         """True if it's stuck in an active status with no movement —
@@ -108,6 +108,9 @@ class StatusEvent(models.Model):
 
     class Meta:
         ordering = ["occurred_at"]
+        indexes = [
+            models.Index(fields=["application", "occurred_at"]),
+        ]
 
     def __str__(self):
         return f"{self.application_id} -> {self.status} @ {self.occurred_at:%Y-%m-%d}"

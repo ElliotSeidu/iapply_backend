@@ -1,9 +1,12 @@
 from datetime import timedelta
+import re
 
 from django.utils import timezone
 from rest_framework import serializers
 
 from .models import Application, Reminder, StatusEvent
+
+_DANGEROUS_SCHEMES = ("javascript:", "data:", "vbscript:")
 
 
 class StatusEventSerializer(serializers.ModelSerializer):
@@ -26,6 +29,12 @@ class ReminderSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ["id", "is_auto_generated"]
 
+    def validate_application(self, value):
+        request = self.context.get("request")
+        if request and getattr(request, "user", None) and value.user_id != request.user.id:
+            raise serializers.ValidationError("Invalid application.")
+        return value
+
     def validate_remind_at(self, value):
         """Reject reminders set more than 2 years in the future."""
         max_future = timezone.localdate() + timedelta(days=730)
@@ -42,6 +51,7 @@ class ApplicationSerializer(serializers.ModelSerializer):
     reminders = ReminderSerializer(many=True, read_only=True)
     days_since_applied = serializers.SerializerMethodField()
     is_stale = serializers.SerializerMethodField()
+    notes = serializers.CharField(required=False, allow_blank=True, max_length=4000)
 
     class Meta:
         model = Application
@@ -71,6 +81,18 @@ class ApplicationSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         ]
+
+    def validate_monthly_salary(self, value):
+        if value is not None and value < 0:
+            raise serializers.ValidationError("Monthly salary cannot be negative.")
+        return value
+
+    def validate_source_detail(self, value):
+        cleaned = (value or "").strip()
+        collapsed = re.sub(r"[\s\x00-\x1f]+", "", cleaned.lower())
+        if any(collapsed.startswith(scheme) for scheme in _DANGEROUS_SCHEMES):
+            raise serializers.ValidationError("Invalid URL scheme in source detail.")
+        return cleaned
 
     def validate_date_applied(self, value):
         """
@@ -104,4 +126,4 @@ class ApplicationStatusChangeSerializer(serializers.Serializer):
     goes through StatusEvent and the sync signal."""
 
     status = serializers.ChoiceField(choices=Application.Status.choices)
-    notes = serializers.CharField(required=False, allow_blank=True)
+    notes = serializers.CharField(required=False, allow_blank=True, max_length=4000)

@@ -23,18 +23,27 @@ class SecurityHeadersMiddleware:
         csp_directives = [
             "default-src 'none'",
             "img-src 'self' data: https:",
-            "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
+            "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://accounts.google.com/gsi/style",
             "font-src 'self' https://fonts.gstatic.com data:",
-            "script-src 'self'",
-            "connect-src 'self'",
+            # Exact Google Identity Services script URL required for Sign In with Google.
+            "script-src 'self' https://accounts.google.com/gsi/client",
+            # API calls to our own backend + Google Identity Services credential exchange.
+            "connect-src 'self' https://accounts.google.com/gsi/",
+            # Google One-Tap / Sign-In button renders inside an iframe from GIS.
+            "frame-src https://accounts.google.com/gsi/",
             "frame-ancestors 'none'",
             "base-uri 'none'",
             "form-action 'self'",
         ]
         csp_header_value = "; ".join(csp_directives)
+        csp_header_name = (
+            "Content-Security-Policy-Report-Only"
+            if getattr(settings, "CSP_REPORT_ONLY", False)
+            else "Content-Security-Policy"
+        )
 
-        if "Content-Security-Policy" not in response:
-            response["Content-Security-Policy"] = csp_header_value
+        if csp_header_name not in response:
+            response[csp_header_name] = csp_header_value
 
         # Permissions-Policy to disable unnecessary browser APIs (camera, mic, geolocation)
         if "Permissions-Policy" not in response:
