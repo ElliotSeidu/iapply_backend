@@ -10,6 +10,7 @@ sqlparse==0.5.5
 tzdata==2026.3
 whitenoise==6.12.0
 google-auth==2.41.1
+requests==2.34.2
 
 # ── PostgreSQL driver (required when DB_ENGINE=postgres) ──────────────────────
 # Use psycopg2-binary for quick deploys; replace with psycopg2 (compiled from

@@ -11,12 +11,12 @@ from django.test import TestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
 from google.auth import exceptions as google_exceptions
+import requests
 from rest_framework.test import APIClient, APITestCase
 from rest_framework_simplejwt.token_blacklist.models import BlacklistedToken
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from config.settings import check_shared_throttle_cache
-from .google_auth import _StdlibHttpsRequest
 from .models import EmailVerification, PasswordResetRequest, User
 
 
@@ -717,8 +717,29 @@ class GoogleSignInSecurityTests(APITestCase):
 		inactive.refresh_from_db()
 		self.assertIsNone(inactive.google_sub)
 
-	def test_stdlib_https_transport_rejects_non_https_urls(self):
-		transport = _StdlibHttpsRequest()
-		for bad_url in ('http://www.googleapis.com/oauth2/v3/certs', 'file:///etc/passwd'):
-			with self.assertRaises(google_exceptions.TransportError):
-				transport(bad_url)
+	def test_google_auth_uses_official_requests_transport_with_timeout(self):
+		captured = {}
+
+		def fake_verify(token, transport_request, audience):
+			captured['transport_request'] = transport_request
+			return self._claims(jti='jti-transport-check')
+
+		with patch('google.oauth2.id_token.verify_oauth2_token', side_effect=fake_verify):
+			resp = self.client.post(self.url, {'credential': 'tok-transport'}, format='json')
+
+		self.assertEqual(resp.status_code, 200)
+		req_callable = captured['transport_request']
+		self.assertEqual(req_callable.keywords.get('timeout'), 10)
+		self.assertEqual(
+			type(req_callable.func).__module__,
+			'google.auth.transport.requests',
+		)
+
+	def test_google_cert_fetch_timeout_maps_to_generic_503(self):
+		with patch(
+			'requests.Session.request',
+			side_effect=requests.exceptions.Timeout('timed out'),
+		):
+			resp = self.client.post(self.url, {'credential': 'tok-timeout'}, format='json')
+		self.assertEqual(resp.status_code, 503)
+		self.assertEqual(resp.data, {'message': 'Google sign-in is not available right now.'})
