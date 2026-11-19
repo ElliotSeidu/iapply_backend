@@ -1,12 +1,12 @@
 from datetime import timedelta
 import importlib
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from django.apps import apps as django_apps
 from django.conf import settings
 from django.core.cache import cache
-from django.db import connection
+from django.db import DatabaseError, connection
 from django.test import TestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
@@ -743,3 +743,86 @@ class GoogleSignInSecurityTests(APITestCase):
 			resp = self.client.post(self.url, {'credential': 'tok-timeout'}, format='json')
 		self.assertEqual(resp.status_code, 503)
 		self.assertEqual(resp.data, {'message': 'Google sign-in is not available right now.'})
+
+	def test_transient_db_failure_does_not_burn_token_and_retry_succeeds(self):
+		claims = self._claims(email='retry@example.com', sub='sub-retry', jti='jti-retry-1')
+		with patch('google.oauth2.id_token.verify_oauth2_token', return_value=claims):
+			with patch(
+				'accounts.views.RefreshToken.for_user',
+				side_effect=DatabaseError('transient db error'),
+			):
+				failed = self.client.post(self.url, {'credential': 'tok-retry'}, format='json')
+			self.assertEqual(failed.status_code, 503)
+			self.assertFalse(User.objects.filter(email='retry@example.com').exists())
+
+			retried = self.client.post(self.url, {'credential': 'tok-retry'}, format='json')
+		self.assertEqual(retried.status_code, 200)
+		self.assertIn('access', retried.data)
+		self.assertTrue(User.objects.filter(email='retry@example.com').exists())
+
+	def test_inactive_user_failure_does_not_burn_token(self):
+		user = User.objects.create_user(
+			email='reactivate@example.com',
+			password='StrongPassw0rd!',
+			is_active=False,
+		)
+		claims = self._claims(
+			email='reactivate@example.com',
+			sub='sub-reactivate',
+			jti='jti-reactivate-1',
+		)
+		with patch('google.oauth2.id_token.verify_oauth2_token', return_value=claims):
+			first = self.client.post(self.url, {'credential': 'tok-reactivate'}, format='json')
+			self.assertEqual(first.status_code, 400)
+
+			user.is_active = True
+			user.save(update_fields=['is_active'])
+
+			second = self.client.post(self.url, {'credential': 'tok-reactivate'}, format='json')
+		self.assertEqual(second.status_code, 200)
+		self.assertIn('access', second.data)
+
+	def test_replay_cache_outage_fails_closed_with_503_and_rolls_back(self):
+		claims = self._claims(email='cachefail@example.com', sub='sub-cf', jti='jti-cf-1')
+		with patch('google.oauth2.id_token.verify_oauth2_token', return_value=claims):
+			failing_get_cache = MagicMock()
+			failing_get_cache.get.side_effect = ConnectionError('redis down')
+			with patch('accounts.google_auth.cache', failing_get_cache):
+				resp_get = self.client.post(self.url, {'credential': 'tok-cf-1'}, format='json')
+			self.assertEqual(resp_get.status_code, 503)
+
+			failing_add_cache = MagicMock()
+			failing_add_cache.get.return_value = None
+			failing_add_cache.add.side_effect = ConnectionError('redis down')
+			with patch('accounts.google_auth.cache', failing_add_cache):
+				resp_add = self.client.post(self.url, {'credential': 'tok-cf-1'}, format='json')
+			self.assertEqual(resp_add.status_code, 503)
+
+		self.assertFalse(User.objects.filter(email='cachefail@example.com').exists())
+
+	def test_replay_ttl_does_not_exceed_remaining_validity_and_rejects_expired(self):
+		short_claims = self._claims(
+			email='shortttl@example.com',
+			sub='sub-short',
+			jti='jti-short-ttl',
+			exp=int(timezone.now().timestamp()) + 12,
+		)
+		with patch('google.oauth2.id_token.verify_oauth2_token', return_value=short_claims), patch(
+			'accounts.google_auth.cache.add', wraps=cache.add
+		) as mock_add:
+			resp = self.client.post(self.url, {'credential': 'tok-short'}, format='json')
+		self.assertEqual(resp.status_code, 200)
+		mock_add.assert_called_once()
+		timeout_used = mock_add.call_args.kwargs['timeout']
+		self.assertGreaterEqual(timeout_used, 1)
+		self.assertLessEqual(timeout_used, 12)
+
+		expired_claims = self._claims(
+			email='expired@example.com',
+			sub='sub-exp',
+			jti='jti-expired',
+			exp=int(timezone.now().timestamp()),
+		)
+		with patch('google.oauth2.id_token.verify_oauth2_token', return_value=expired_claims):
+			expired_resp = self.client.post(self.url, {'credential': 'tok-expired'}, format='json')
+		self.assertEqual(expired_resp.status_code, 400)

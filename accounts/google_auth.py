@@ -106,15 +106,30 @@ def verify_google_id_token(id_token):
     if not email:
         raise GoogleAuthError('Google account did not provide an email address.')
 
-    # Enforce single-use replay protection only after signature and claims validate.
+    # Check replay cache after verifying signature/claims (without burning yet;
+    # the view marks the token consumed only once login/issuance succeeds).
+    # Note: LocMemCache is per-process, so replay protection is only reliable
+    # across multiple Gunicorn workers when REDIS_URL is configured.
     replay_seed = str(claims.get('jti') or id_token)
     digest = hashlib.sha256(replay_seed.encode('utf-8')).hexdigest()
+    replay_key = f'google_id_token_used:{digest}'
     exp = claims.get('exp')
     if isinstance(exp, (int, float)):
-        ttl = max(60, min(3600, int(exp - time.time())))
+        remaining = int(exp - time.time())
+        if remaining <= 0:
+            raise GoogleAuthError('Google credential has expired.')
+        replay_ttl = min(3600, remaining)
     else:
-        ttl = 3600
-    if not cache.add(f'google_id_token_used:{digest}', 1, timeout=ttl):
+        replay_ttl = 3600
+
+    try:
+        already_used = cache.get(replay_key)
+    except Exception as exc:
+        # Fail closed on cache outages so a Redis failure never silently bypasses replay checks.
+        logger.error('Google replay cache lookup failed: %s', exc)
+        raise GoogleAuthServiceError('Replay protection cache is unavailable.') from exc
+
+    if already_used:
         raise GoogleAuthError('Google credential has already been used.')
 
     return {
@@ -125,7 +140,27 @@ def verify_google_id_token(id_token):
         'full_name': (claims.get('name') or '').strip(),
         'google_sub': google_sub,
         'picture': claims.get('picture') or '',
+        'replay_key': replay_key,
+        'replay_ttl': replay_ttl,
     }
+
+
+def mark_google_id_token_used(replay_key, ttl):
+    """Mark a verified Google ID token's replay key as consumed.
+
+    Called only after user lookup/creation and JWT issuance succeed so a
+    failed login attempt does not burn a valid credential. Fails closed (503)
+    if the cache backend raises an error. Cross-worker enforcement requires a
+    shared cache (REDIS_URL).
+    """
+    try:
+        added = cache.add(replay_key, 1, timeout=ttl)
+    except Exception as exc:
+        logger.error('Google replay cache write failed: %s', exc)
+        raise GoogleAuthServiceError('Replay protection cache is unavailable.') from exc
+
+    if not added:
+        raise GoogleAuthError('Google credential has already been used.')
 
 
 def split_google_name(info):

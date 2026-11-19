@@ -1,5 +1,6 @@
 from datetime import timedelta
 import hashlib
+import logging
 import secrets
 
 from django.conf import settings
@@ -8,7 +9,7 @@ from django.contrib.auth.password_validation import validate_password
 from django.core.cache import cache
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.core.mail import send_mail
-from django.db import IntegrityError, transaction
+from django.db import DatabaseError, IntegrityError, transaction
 from django.utils import timezone
 
 from rest_framework import generics, status
@@ -23,6 +24,7 @@ from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
 from .google_auth import (
     GoogleAuthError,
     GoogleAuthServiceError,
+    mark_google_id_token_used,
     split_google_name,
     verify_google_id_token,
 )
@@ -48,6 +50,8 @@ from .throttles import (
     RegisterRateThrottle,
     VerifyRateThrottle,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _is_dev_console():
@@ -574,6 +578,8 @@ class GoogleLoginView(APIView):
 
         inactive_or_mismatch = False
         created = False
+        refresh = None
+        token_marked = False
 
         try:
             with transaction.atomic():
@@ -605,17 +611,48 @@ class GoogleLoginView(APIView):
                 elif not user.is_active:
                     inactive_or_mismatch = True
 
-                if not inactive_or_mismatch:
+                if not inactive_or_mismatch and user is not None:
                     # A Google-verified address proves ownership, so any half-finished
                     # email-verification record for it is now redundant.
                     EmailVerification.objects.filter(email__iexact=email).delete()
-        except IntegrityError:
+                    refresh = RefreshToken.for_user(user)
+                    # Burn token only after DB changes and JWT issuance succeed so a
+                    # failed login never consumes a valid token.
+                    mark_google_id_token_used(info['replay_key'], info['replay_ttl'])
+                    token_marked = True
+        except GoogleAuthServiceError:
+            return Response(
+                {'message': 'Google sign-in is not available right now.'},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        except GoogleAuthError:
             return Response(
                 {'message': 'Could not verify that Google account. Please try again.'},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+        except IntegrityError:
+            if token_marked:
+                try:
+                    cache.delete(info['replay_key'])
+                except Exception:
+                    pass
+            return Response(
+                {'message': 'Could not verify that Google account. Please try again.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        except DatabaseError as exc:
+            if token_marked:
+                try:
+                    cache.delete(info['replay_key'])
+                except Exception:
+                    pass
+            logger.error('Database error during Google login: %s', exc)
+            return Response(
+                {'message': 'Google sign-in is not available right now.'},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
 
-        if inactive_or_mismatch or user is None:
+        if inactive_or_mismatch or user is None or refresh is None:
             # Same generic message as an invalid token — do not reveal that the
             # account exists, is disabled, or conflicts on Google subject ID.
             return Response(
@@ -625,7 +662,6 @@ class GoogleLoginView(APIView):
 
         # Same response shape as /account/login/ so the frontend can reuse a
         # single code path for both sign-in methods.
-        refresh = RefreshToken.for_user(user)
         return Response(
             {
                 'access': str(refresh.access_token),
