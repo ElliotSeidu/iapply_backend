@@ -132,6 +132,9 @@ class Reminder(models.Model):
 
     class Meta:
         ordering = ["remind_at"]
+        indexes = [
+            models.Index(fields=["application", "remind_at"]),
+        ]
 
     def __str__(self):
         return f"Reminder: {self.message} ({self.application_id})"

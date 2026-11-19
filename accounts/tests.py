@@ -1120,3 +1120,56 @@ class ProductionConfigAndHealthTests(APITestCase):
 		self.assertEqual(parsed['logger'], 'accounts.tests')
 		self.assertEqual(parsed['message'], 'Login failed for user_redacted')
 		self.assertIn('timestamp', parsed)
+
+
+class EmailNormalizationAuditCommandTests(TestCase):
+	def test_clean_users_pass_with_counts_only(self):
+		from io import StringIO
+		from django.core.management import call_command
+
+		User.objects.create_user(email='clean@example.com', password='Password123!')
+		out = StringIO()
+		call_command('check_email_normalization', stdout=out)
+		output = out.getvalue()
+		self.assertIn('total_users=1', output)
+		self.assertIn('mixed_case_or_untrimmed_users=0', output)
+		self.assertIn('case_insensitive_duplicate_groups=0', output)
+		self.assertIn('users_in_duplicate_groups=0', output)
+		self.assertNotIn('clean@example.com', output)
+
+	def test_mixed_case_row_reported_without_email_leak(self):
+		from io import StringIO
+		from django.core.management import call_command
+
+		user = User.objects.create_user(email='mixed@example.com', password='Password123!')
+		User.objects.filter(pk=user.pk).update(email='MixedCase@Example.COM')
+
+		out = StringIO()
+		call_command('check_email_normalization', stdout=out)
+		output = out.getvalue()
+		self.assertIn('total_users=1', output)
+		self.assertIn('mixed_case_or_untrimmed_users=1', output)
+		self.assertIn('case_insensitive_duplicate_groups=0', output)
+		self.assertNotIn('MixedCase@Example.COM', output)
+		self.assertNotIn('mixedcase@example.com', output)
+
+	def test_case_insensitive_duplicate_emails_raise_command_error(self):
+		from io import StringIO
+		from django.core.management import call_command
+		from django.core.management.base import CommandError
+
+		u1 = User.objects.create_user(email='dup1@example.com', password='Password123!')
+		u2 = User.objects.create_user(email='dup2@example.com', password='Password123!')
+		User.objects.filter(pk=u1.pk).update(email='DupUser@Example.COM')
+		User.objects.filter(pk=u2.pk).update(email='dupuser@example.com')
+
+		out = StringIO()
+		with self.assertRaises(CommandError) as ctx:
+			call_command('check_email_normalization', stdout=out)
+		output = out.getvalue()
+		self.assertIn('case_insensitive_duplicate_groups=1', output)
+		self.assertIn('users_in_duplicate_groups=2', output)
+		self.assertNotIn('DupUser@Example.COM', output)
+		self.assertNotIn('dupuser@example.com', output)
+		self.assertNotIn('DupUser', str(ctx.exception))
+		self.assertNotIn('dupuser', str(ctx.exception).lower())
