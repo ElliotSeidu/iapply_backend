@@ -17,6 +17,13 @@
 
 Set `DEPLOYMENT_ENV=production`, `DEBUG=False`, HTTPS-only settings, a real email backend, and `CSP_REPORT_ONLY=False`. The settings module rejects production configurations that use SQLite, non-TLS PostgreSQL, non-delivery email backends, insecure redirects, short `SECRET_KEY` values (< 50 chars), or report-only CSP.
 
+### Database configuration (`DB_*` variables; `DATABASE_URL` is unused)
+
+`config/settings.py` does **not** use `dj-database-url` and does **not** read `DATABASE_URL`. Configure the database explicitly via environment variables:
+
+- **Development (default)**: `DB_ENGINE=sqlite3` (no other database variables required; writes to `db.sqlite3`).
+- **Production (PostgreSQL, required when `DEPLOYMENT_ENV=production`)**: set `DB_ENGINE=postgres`, `DB_NAME`, `DB_USER`, `DB_PASSWORD`, `DB_HOST`, `DB_PORT` (defaults to `5432`), and `DB_SSLMODE` (defaults to `require` in `production` / `prefer` otherwise; must be `require`, `verify-ca`, or `verify-full` in `production`).
+
 Set `REDIS_URL` in multi-worker production deployments (e.g. Gunicorn with multiple workers) so DRF throttles, per-email rate limits, and Google ID-token replay caches are shared across workers rather than isolated per worker. Without `REDIS_URL`, Django falls back to `LocMemCache`, which is per-process — Google ID-token replay protection is NOT reliable across multiple workers unless `REDIS_URL` is configured.
 
 Google ID-token replay checking and marking **fail closed** (returning HTTP 503) if the cache backend raises an error, so a cache outage never silently disables replay protection or triggers an unhandled 500 error.
