@@ -38,6 +38,28 @@ from .throttles import (
 )
 
 
+def _is_dev_console():
+    """True only for local development with the console email backend, where
+    OTP codes are echoed to the terminal so no SMTP server is needed."""
+    return (
+        getattr(settings, 'DEBUG', False)
+        and getattr(settings, 'DEPLOYMENT_ENV', 'development') != 'production'
+        and getattr(settings, 'EMAIL_BACKEND', '') == 'django.core.mail.backends.console.EmailBackend'
+    )
+
+
+def _blacklist_user_tokens(user):
+    """Revoke every outstanding, not-yet-blacklisted refresh token for `user`."""
+    for token in OutstandingToken.objects.filter(
+        user=user,
+        blacklistedtoken__isnull=True,
+    ):
+        try:
+            RefreshToken(token.token).blacklist()
+        except Exception:
+            continue
+
+
 class RegistrationView(APIView):
     """
     Initiates the email-verification registration flow.
@@ -57,11 +79,7 @@ class RegistrationView(APIView):
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
         email = data['email'].strip().lower()
-        is_dev_console = (
-            getattr(settings, 'DEBUG', False)
-            and getattr(settings, 'DEPLOYMENT_ENV', 'development') != 'production'
-            and getattr(settings, 'EMAIL_BACKEND', '') == 'django.core.mail.backends.console.EmailBackend'
-        )
+        is_dev_console = _is_dev_console()
 
         # Always return the same response whether or not the email is already
         # registered — avoids leaking which emails exist (user enumeration).
@@ -251,12 +269,7 @@ class PasswordResetRequestView(APIView):
                 email=email,
                 code_hash=make_password(code),
             )
-            is_dev_console = (
-                getattr(settings, 'DEBUG', False)
-                and getattr(settings, 'DEPLOYMENT_ENV', 'development') != 'production'
-                and getattr(settings, 'EMAIL_BACKEND', '') == 'django.core.mail.backends.console.EmailBackend'
-            )
-            if is_dev_console:
+            if _is_dev_console():
                 print(
                     f"\n{'=' * 64}\n"
                     f"  [iApply OTP] Password Reset Code\n"
@@ -338,14 +351,7 @@ class PasswordResetConfirmView(APIView):
             user.save(update_fields=['password'])
             record.delete()
 
-        for token in OutstandingToken.objects.filter(
-            user=user,
-            blacklistedtoken__isnull=True,
-        ):
-            try:
-                RefreshToken(token.token).blacklist()
-            except Exception:
-                continue
+        _blacklist_user_tokens(user)
 
         return Response({"message": "Password reset successfully."}, status=status.HTTP_200_OK)
 
@@ -407,14 +413,7 @@ class ChangePasswordView(APIView):
             )
         user.set_password(serializer.validated_data['new_password'])
         user.save()
-        for token in OutstandingToken.objects.filter(
-            user=user,
-            blacklistedtoken__isnull=True,
-        ):
-            try:
-                RefreshToken(token.token).blacklist()
-            except Exception:
-                continue
+        _blacklist_user_tokens(user)
         return Response(
             {"message": "Password updated successfully."},
             status=status.HTTP_200_OK,
@@ -437,14 +436,7 @@ class DeleteAccountView(generics.DestroyAPIView):
                     {"message": "Invalid password."},
                     status=status.HTTP_401_UNAUTHORIZED,
                 )
-        for token in OutstandingToken.objects.filter(
-            user=user,
-            blacklistedtoken__isnull=True,
-        ):
-            try:
-                RefreshToken(token.token).blacklist()
-            except Exception:
-                continue
+        _blacklist_user_tokens(user)
         user.delete()
         return Response(
             {"message": "Account deleted successfully."},

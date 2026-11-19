@@ -155,8 +155,6 @@ SIMPLE_JWT = {
     # Prevent the algorithm from being downgraded by a malicious token header.
     "ALGORITHM": "HS256",
     "SIGNING_KEY": SECRET_KEY,
-    # Use the standard 'sub' claim for user ID so tokens are compatible with
-    # third-party tooling.
     "USER_ID_FIELD": "id",
     "USER_ID_CLAIM": "user_id",
 }

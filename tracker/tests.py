@@ -1,11 +1,12 @@
 from datetime import date, timedelta
+from unittest import mock
 
 from django.urls import reverse
 from django.utils import timezone
 from rest_framework.test import APITestCase
 
 from accounts.models import User
-from .models import Application, StatusEvent
+from .models import Application, Reminder, StatusEvent
 
 
 class TrackerSecurityAndAnalyticsTests(APITestCase):
@@ -106,3 +107,40 @@ class OtpFormatTests(APITestCase):
                                     {'email': 'x@example.com', 'code': bad}, format='json')
             self.assertEqual(resp.status_code, 400, bad[:10])
             self.assertIn('code', resp.data)
+
+
+class RegressionTests(APITestCase):
+    def setUp(self):
+        self.user = User.objects.create_user(email='r@example.com', password='StrongPassw0rd!')
+        self.client.force_authenticate(self.user)
+
+    def test_date_applied_validation_does_not_crash_on_29_feb(self):
+        # Previously `today.replace(year=today.year - 50)` raised ValueError
+        # (HTTP 500) when the request was made on 29 Feb.
+        with mock.patch('tracker.serializers.timezone.localdate', return_value=date(2028, 2, 29)):
+            resp = self.client.post(reverse('application-list'), {
+                'company_name': 'X', 'role_title': 'Y', 'channel': 'email',
+                'date_applied': '2028-02-01',
+            }, format='json')
+        self.assertEqual(resp.status_code, 201)
+
+    def test_application_list_query_count_is_constant(self):
+        for i in range(8):
+            app = Application.objects.create(
+                user=self.user, company_name=f'Co{i}', role_title='Dev', channel='email',
+            )
+            Reminder.objects.create(application=app, remind_at=timezone.now(), message='m')
+        # session-less JWT auth: count + page of apps + 2 prefetches. Must not grow with N.
+        with self.assertNumQueries(4):
+            resp = self.client.get(reverse('application-list'))
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(len(resp.data['results']), 8)
+
+    def test_reminder_list_is_scoped_and_cheap(self):
+        other = User.objects.create_user(email='o@example.com', password='StrongPassw0rd!')
+        mine = Application.objects.create(user=self.user, company_name='A', role_title='D', channel='email')
+        theirs = Application.objects.create(user=other, company_name='B', role_title='D', channel='email')
+        Reminder.objects.create(application=mine, remind_at=timezone.now(), message='mine')
+        Reminder.objects.create(application=theirs, remind_at=timezone.now(), message='theirs')
+        resp = self.client.get(reverse('reminder-list'))
+        self.assertEqual([r['message'] for r in resp.data['results']], ['mine'])

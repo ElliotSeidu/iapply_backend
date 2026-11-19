@@ -76,11 +76,7 @@ class ReminderViewSet(viewsets.ModelViewSet):
     permission_classes = [permissions.IsAuthenticated]
 
     def get_queryset(self):
-        return (
-            Reminder.objects
-            .filter(application__user=self.request.user)
-            .select_related('application')
-        )
+        return Reminder.objects.filter(application__user=self.request.user)
 
     def get_serializer(self, *args, **kwargs):
         serializer = super().get_serializer(*args, **kwargs)
