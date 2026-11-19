@@ -65,3 +65,24 @@ python manage.py check --deploy
 python manage.py makemigrations --check --dry-run
 python manage.py test
 ```
+
+## Vulnerability disclosure & secret rotation
+
+### Reporting a vulnerability
+
+Do **not** open public GitHub issues or pull requests for suspected security vulnerabilities. Report vulnerabilities privately to the repository maintainers (or via GitHub Private Vulnerability Reporting if enabled on the repository) with reproduction steps and affected endpoints or components.
+
+### Secret rotation procedures & impact
+
+- **`SECRET_KEY` (Django & SimpleJWT signing key):**
+  - Generate a new 64+ character random value (`python -c "import secrets; print(secrets.token_urlsafe(64))"`), update the production environment secret, and redeploy all API workers simultaneously.
+  - **Impact:** `config/settings.py` reads `SECRET_KEY` (and SimpleJWT uses it as its default signing key), so rotating it immediately invalidates all existing JWT access tokens, refresh tokens, and signed session/CSRF values; active users must sign in again. (Zero-downtime fallback verification for Django's own signing would require wiring `SECRET_KEY_FALLBACKS` in `config/settings.py`, which is not configured today.)
+- **`GOOGLE_CLIENT_ID` (OAuth client ID):**
+  - Coordinate updates across backend (`GOOGLE_CLIENT_ID`) and frontend build (`VITE_GOOGLE_CLIENT_ID`). Keep the new client within the same Google Cloud project if continuing to match existing `google_sub` account links cleanly.
+  - Update backend first (or maintain matching client IDs during cutover), rebuild/deploy frontend, verify `/account/google/` login, then delete or disable the retired OAuth client in Google Cloud Console.
+- **PostgreSQL credentials (`DB_USER` / `DB_PASSWORD` / `DB_HOST`):**
+  - Note that `config/settings.py` reads the discrete `DB_*` variables (it does not parse `DATABASE_URL`). Provision updated credentials/role on the database server, roll all backend workers with the new `DB_USER` / `DB_PASSWORD` (and TLS `DB_SSLMODE`), confirm `GET /readyz` returns HTTP `200`, then revoke the previous database password/role.
+- **Redis credentials (`REDIS_URL`):**
+  - Rotate the TLS Redis password/ACL cleanly across workers and verify `GET /readyz` returns HTTP `200`. Because rate limiting, email quotas, and Google ID-token replay protection fail closed, mismatched Redis credentials cause auth-protected endpoints and `/readyz` to return HTTP `503`.
+- **SMTP credentials (`EMAIL_HOST_PASSWORD`):**
+  - Generate a new provider SMTP key/password, roll backend workers, verify OTP delivery for verification/reset/Google-only account deletion, then revoke the previous credential.

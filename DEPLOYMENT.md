@@ -5,7 +5,7 @@
 1. **Back up the PostgreSQL database before every release:**
 
    ```bash
-   pg_dump --format=custom --no-owner --no-acl "$DATABASE_URL" > "iapply_predeploy_$(date -u +%Y%m%dT%H%M%SZ).dump"
+   PGSSLMODE=verify-full pg_dump --format=custom --no-owner --no-acl -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" > "iapply_predeploy_$(date -u +%Y%m%dT%H%M%SZ).dump"
    ```
 
 2. **Audit existing `User.email` rows (run against a staging copy or maintenance snapshot first):**
@@ -40,13 +40,18 @@
 
 ## PostgreSQL Staging / CI Verification (Required Before Production Go-Live)
 
-This repository does not assume PostgreSQL is installed on a local developer workstation. Before deploying to production, run the full migration chain and test suite against the target PostgreSQL engine version:
+This repository does not assume PostgreSQL is installed on a local developer workstation. Note that `config/settings.py` reads the discrete `DB_*` variables below (it does **not** parse `DATABASE_URL`, and `CONN_MAX_AGE` is fixed at `60`). Before deploying to production, run the full migration chain and test suite against the target PostgreSQL engine version:
 
 ```bash
 export DEPLOYMENT_ENV=production
 export SECRET_KEY="<64+ char random value>"
-export DATABASE_URL="postgres://<user>:<password>@<host>:5432/<db>?sslmode=verify-full"
-export DB_CONN_MAX_AGE=60
+export DB_ENGINE=postgres
+export DB_NAME="<db-name>"
+export DB_USER="<db-user>"
+export DB_PASSWORD="<db-password>"
+export DB_HOST="<db-host>"
+export DB_PORT="5432"
+export DB_SSLMODE=verify-full
 export REDIS_URL="rediss://:<password>@<redis-host>:6379/1"
 export CORS_ALLOWED_ORIGINS="https://<your-frontend-origin>"
 export CSRF_TRUSTED_ORIGINS="https://<your-api-origin>"
@@ -73,7 +78,7 @@ python manage.py test
 3. **Full data rollback (destructive schema/data recovery):** Restore from the pre-deploy `pg_dump` or managed PostgreSQL point-in-time recovery (PITR) snapshot taken in Step 1:
 
    ```bash
-   pg_restore --clean --if-exists --no-owner --no-acl -d "$DATABASE_URL" iapply_predeploy_<timestamp>.dump
+   PGSSLMODE=verify-full pg_restore --clean --if-exists --no-owner --no-acl -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d "$DB_NAME" iapply_predeploy_<timestamp>.dump
    ```
 
 ## Running in Production (Gunicorn & Static Files)
