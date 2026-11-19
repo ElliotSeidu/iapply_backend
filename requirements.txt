@@ -24,7 +24,8 @@ psycopg2-binary==2.9.10
 # as the first entry in settings.PASSWORD_HASHERS.
 argon2-cffi==23.1.0
 
-# ── Shared Redis cache (recommended for multi-worker production) ──────────────
-# Required when REDIS_URL is set so DRF throttles, per-email limits, and
-# Google ID-token replay protection are shared across Gunicorn workers.
-# redis==5.2.1
+# ── Shared Redis cache (required for multi-worker production) ─────────────────
+# Required when DEPLOYMENT_ENV=production (with rediss:// TLS URL) so DRF
+# throttles, per-email limits, and Google ID-token replay protection are
+# shared across Gunicorn workers.
+redis==8.1.0

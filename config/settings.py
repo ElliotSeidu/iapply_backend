@@ -187,8 +187,8 @@ REST_FRAMEWORK = {
         'rest_framework.permissions.IsAuthenticated',
     ),
     'DEFAULT_THROTTLE_CLASSES': [
-        'rest_framework.throttling.AnonRateThrottle',
-        'rest_framework.throttling.UserRateThrottle',
+        'accounts.throttles.FailClosedAnonRateThrottle',
+        'accounts.throttles.FailClosedUserRateThrottle',
     ],
     'DEFAULT_THROTTLE_RATES': {
         # Global buckets (shared across all endpoints of that type)
@@ -230,15 +230,21 @@ STORAGES = {
     },
 }
 
-# Configurable throttle cache: use Redis in multi-worker production (REDIS_URL),
+# Configurable throttle cache: use TLS Redis in multi-worker production (REDIS_URL),
 # falling back safely to LocMemCache for local development/testing.
 REDIS_URL = config('REDIS_URL', default='').strip()
+REDIS_SOCKET_CONNECT_TIMEOUT = config('REDIS_SOCKET_CONNECT_TIMEOUT', default=3, cast=int)
+REDIS_SOCKET_TIMEOUT = config('REDIS_SOCKET_TIMEOUT', default=3, cast=int)
 if REDIS_URL:
     CACHES = {
         "default": {
             "BACKEND": "django.core.cache.backends.redis.RedisCache",
             "LOCATION": REDIS_URL,
             "KEY_PREFIX": "iapply",
+            "OPTIONS": {
+                "socket_connect_timeout": REDIS_SOCKET_CONNECT_TIMEOUT,
+                "socket_timeout": REDIS_SOCKET_TIMEOUT,
+            },
         }
     }
 else:
@@ -252,19 +258,27 @@ else:
 
 @checks.register(checks.Tags.security, deploy=True)
 def check_shared_throttle_cache(app_configs, **kwargs):
-    if DEPLOYMENT_ENV == 'production' and not REDIS_URL:
-        return [
+    issues = []
+    if DEPLOYMENT_ENV in {'staging', 'production'} and not REDIS_URL:
+        issues.append(
             checks.Warning(
                 'REDIS_URL is not configured in production.',
                 hint=(
-                    'Set REDIS_URL (e.g. redis://...) so DRF throttles, per-email '
+                    'Set REDIS_URL (e.g. rediss://...) so DRF throttles, per-email '
                     'rate limits, and Google ID-token replay protection are shared '
                     'across Gunicorn workers.'
                 ),
                 id='iapply.W001',
             )
-        ]
-    return []
+        )
+    if DEPLOYMENT_ENV == 'production' and REDIS_URL and not REDIS_URL.startswith('rediss://'):
+        issues.append(
+            checks.Error(
+                'Production REDIS_URL must use TLS (rediss://).',
+                id='iapply.E001',
+            )
+        )
+    return issues
 
 # H9 Fix: Add basic logging to capture 500 errors in production.
 LOGGING = {
@@ -456,3 +470,7 @@ if DEPLOYMENT_ENV == 'production':
         )
     if EMAIL_BACKEND in _DISALLOWED_PROD_EMAIL_BACKENDS:
         raise ImproperlyConfigured('Production email must use a real delivery backend.')
+    if not REDIS_URL:
+        raise ImproperlyConfigured('REDIS_URL must be configured in production.')
+    if not REDIS_URL.startswith('rediss://'):
+        raise ImproperlyConfigured('Production REDIS_URL must use TLS (rediss://).')

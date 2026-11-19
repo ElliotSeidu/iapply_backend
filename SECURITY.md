@@ -24,9 +24,13 @@ Set `DEPLOYMENT_ENV=production`, `DEBUG=False`, HTTPS-only settings, a real emai
 - **Development (default)**: `DB_ENGINE=sqlite3` (no other database variables required; writes to `db.sqlite3`).
 - **Production (PostgreSQL, required when `DEPLOYMENT_ENV=production`)**: set `DB_ENGINE=postgres`, `DB_NAME`, `DB_USER`, `DB_PASSWORD`, `DB_HOST`, `DB_PORT` (defaults to `5432`), and `DB_SSLMODE` (defaults to `require` in `production` / `prefer` otherwise; must be `require`, `verify-ca`, or `verify-full` in `production`).
 
-Set `REDIS_URL` in multi-worker production deployments (e.g. Gunicorn with multiple workers) so DRF throttles, per-email rate limits, and Google ID-token replay caches are shared across workers rather than isolated per worker. Without `REDIS_URL`, Django falls back to `LocMemCache`, which is per-process — Google ID-token replay protection is NOT reliable across multiple workers unless `REDIS_URL` is configured.
+Set `REDIS_URL` using TLS (`rediss://...`) in production; `config/settings.py` rejects `DEPLOYMENT_ENV=production` startups when `REDIS_URL` is missing or uses plaintext `redis://`. Socket connect and read timeouts default to `3` seconds (`REDIS_SOCKET_CONNECT_TIMEOUT`, `REDIS_SOCKET_TIMEOUT`). Without `REDIS_URL` (development/staging only), Django falls back to per-process `LocMemCache`.
 
-Google ID-token replay checking and marking **fail closed** (returning HTTP 503) if the cache backend raises an error, so a cache outage never silently disables replay protection or triggers an unhandled 500 error.
+All security-critical cache consumers **fail closed** (HTTP 503 with a generic message, never unhandled HTTP 500 or silent bypass) if Redis is unreachable:
+
+- Global and scoped DRF throttles (`FailClosedAnonRateThrottle`, `FailClosedUserRateThrottle`)
+- Per-email registration / password-reset rate limits (`_consume_email_rate_limit`)
+- Google ID-token replay check and single-use burn (`verify_google_id_token`, `mark_google_id_token_used`)
 
 Set `NUM_PROXIES` and `TRUST_PROXY_SSL_HEADER` to match your reverse-proxy topology, and override `ADMIN_URL` if exposing Django Admin.
 

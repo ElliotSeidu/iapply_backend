@@ -42,6 +42,7 @@ from .serializers import (
     VerificationRequestSerializer,
 )
 from .throttles import (
+    CacheUnavailableError,
     GoogleLoginRateThrottle,
     LoginRateThrottle,
     PasswordActionRateThrottle,
@@ -65,17 +66,24 @@ def _is_dev_console():
 
 
 def _consume_email_rate_limit(scope, email, limit=5, window=3600):
-    """Enforce a per-email rate limit across all IPs to prevent email bombing."""
+    """Enforce a per-email rate limit across all IPs to prevent email bombing.
+
+    Fails closed (HTTP 503) if the cache backend raises an error.
+    """
     digest = hashlib.sha256(email.encode('utf-8')).hexdigest()
     key = f'email_rl:{scope}:{digest}'
-    if cache.add(key, 1, timeout=window):
-        return True
     try:
-        count = cache.incr(key)
-    except ValueError:
-        cache.set(key, 1, timeout=window)
-        return True
-    return count <= limit
+        if cache.add(key, 1, timeout=window):
+            return True
+        try:
+            count = cache.incr(key)
+        except ValueError:
+            cache.set(key, 1, timeout=window)
+            return True
+        return count <= limit
+    except Exception as exc:
+        logger.error('Email rate-limit cache unavailable (%s): %s', scope, exc)
+        raise CacheUnavailableError() from exc
 
 
 def _blacklist_user_tokens(user):

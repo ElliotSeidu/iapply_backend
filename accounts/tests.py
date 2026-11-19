@@ -531,7 +531,77 @@ class AccountSecurityRegressionTests(APITestCase):
 		with patch('config.settings.DEPLOYMENT_ENV', 'production'), patch(
 			'config.settings.REDIS_URL', 'redis://localhost:6379/1'
 		):
+			issues = check_shared_throttle_cache(None)
+		self.assertEqual([i.id for i in issues], ['iapply.E001'])
+
+		with patch('config.settings.DEPLOYMENT_ENV', 'production'), patch(
+			'config.settings.REDIS_URL', 'rediss://localhost:6379/1'
+		):
 			self.assertEqual(check_shared_throttle_cache(None), [])
+
+	def test_all_protected_endpoints_fail_closed_503_on_cache_outage(self):
+		failing_cache = MagicMock()
+		failing_cache.get.side_effect = ConnectionError('redis unreachable')
+		failing_cache.set.side_effect = ConnectionError('redis unreachable')
+		failing_cache.add.side_effect = ConnectionError('redis unreachable')
+		failing_cache.incr.side_effect = ConnectionError('redis unreachable')
+
+		anon_calls = [
+			('post', reverse('login'), {'email': self.user.email, 'password': 'WrongPassword!1'}),
+			('post', reverse('register'), {
+				'email': 'outage@example.com',
+				'password': 'StrongPassw0rd!9',
+				'password2': 'StrongPassw0rd!9',
+				'first_name': 'Out',
+				'last_name': 'Age',
+			}),
+			('post', reverse('register-verify'), {'email': 'outage@example.com', 'code': '123456'}),
+			('post', reverse('password-reset-request'), {'email': self.user.email}),
+			('post', reverse('password-reset-confirm'), {
+				'email': self.user.email,
+				'code': '123456',
+				'password': 'NewStrongPassw0rd!9',
+				'password2': 'NewStrongPassw0rd!9',
+			}),
+			('post', reverse('google-login'), {'credential': 'tok'}),
+			('post', reverse('login-refresh'), {'refresh': 'tok'}),
+		]
+		authed_calls = [
+			('patch', reverse('change-password'), {
+				'old_password': 'StrongPassw0rd!',
+				'new_password': 'AnotherStrongPass!9',
+				'new_password2': 'AnotherStrongPass!9',
+			}),
+			('delete', reverse('delete-account'), {'password': 'StrongPassw0rd!'}),
+			('get', reverse('application-list'), {}),
+		]
+
+		with patch('rest_framework.throttling.SimpleRateThrottle.cache', failing_cache), patch(
+			'accounts.views.cache', failing_cache
+		), patch('accounts.google_auth.cache', failing_cache):
+			self.client.force_authenticate(user=None)
+			for method, url, body in anon_calls:
+				resp = getattr(self.client, method)(url, body, format='json')
+				self.assertEqual(resp.status_code, 503, url)
+				self.assertNotIn('redis unreachable', str(resp.data))
+
+			self.client.force_authenticate(self.user)
+			for method, url, body in authed_calls:
+				resp = getattr(self.client, method)(url, body, format='json')
+				self.assertEqual(resp.status_code, 503, url)
+				self.assertNotIn('redis unreachable', str(resp.data))
+
+	def test_email_rate_limit_fails_closed_503_on_cache_outage(self):
+		failing_cache = MagicMock()
+		failing_cache.add.side_effect = ConnectionError('email rl redis down')
+		with patch('accounts.views.cache', failing_cache):
+			resp = self.client.post(
+				reverse('password-reset-request'),
+				{'email': self.user.email},
+				format='json',
+			)
+		self.assertEqual(resp.status_code, 503)
+		self.assertNotIn('email rl redis down', str(resp.data))
 
 
 @override_settings(GOOGLE_CLIENT_ID='test-client.apps.googleusercontent.com')
