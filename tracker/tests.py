@@ -1,6 +1,7 @@
 from datetime import date, timedelta
 from unittest import mock
 
+from django.core.cache import cache
 from django.urls import reverse
 from django.utils import timezone
 from rest_framework.test import APITestCase
@@ -144,3 +145,181 @@ class RegressionTests(APITestCase):
         Reminder.objects.create(application=theirs, remind_at=timezone.now(), message='theirs')
         resp = self.client.get(reverse('reminder-list'))
         self.assertEqual([r['message'] for r in resp.data['results']], ['mine'])
+
+
+class TrackerSecurityHardeningTests(APITestCase):
+    def setUp(self):
+        cache.clear()
+        self.user_a = User.objects.create_user(email='ta@example.com', password='StrongPassw0rd!')
+        self.user_b = User.objects.create_user(email='tb@example.com', password='StrongPassw0rd!')
+        self.app_b = Application.objects.create(
+            user=self.user_b,
+            company_name='Secret Corp',
+            role_title='Staff Engineer',
+            channel='referral',
+        )
+        self.rem_b = Reminder.objects.create(
+            application=self.app_b,
+            remind_at=timezone.now() + timedelta(days=2),
+            message='Follow up secretly',
+        )
+
+    def tearDown(self):
+        cache.clear()
+
+    def test_unauthenticated_requests_rejected_401(self):
+        for method, url in [
+            ('get', reverse('application-list')),
+            ('post', reverse('application-list')),
+            ('get', reverse('application-detail', args=[self.app_b.pk])),
+            ('post', reverse('application-log-status', args=[self.app_b.pk])),
+            ('get', reverse('reminder-list')),
+            ('get', reverse('reminder-detail', args=[self.rem_b.pk])),
+            ('get', reverse('analytics')),
+        ]:
+            resp = getattr(self.client, method)(url, {}, format='json')
+            self.assertEqual(resp.status_code, 401, url)
+
+    def test_idor_matrix_prevents_cross_user_access_and_analytics_leakage(self):
+        app_a = Application.objects.create(
+            user=self.user_a,
+            company_name='Mine Inc',
+            role_title='Engineer',
+            channel='email',
+        )
+        rem_a = Reminder.objects.create(
+            application=app_a,
+            remind_at=timezone.now() + timedelta(days=1),
+            message='Mine',
+        )
+        self.client.force_authenticate(self.user_a)
+
+        # User A cannot read, edit, delete, or log status on User B's application
+        app_detail_b = reverse('application-detail', args=[self.app_b.pk])
+        self.assertEqual(self.client.get(app_detail_b).status_code, 404)
+        self.assertEqual(
+            self.client.patch(app_detail_b, {'notes': 'pwned'}, format='json').status_code,
+            404,
+        )
+        self.assertEqual(
+            self.client.put(
+                app_detail_b,
+                {'company_name': 'X', 'role_title': 'Y', 'channel': 'email'},
+                format='json',
+            ).status_code,
+            404,
+        )
+        self.assertEqual(self.client.delete(app_detail_b).status_code, 404)
+        self.assertEqual(
+            self.client.post(
+                reverse('application-log-status', args=[self.app_b.pk]),
+                {'status': 'offer'},
+                format='json',
+            ).status_code,
+            404,
+        )
+
+        # User A cannot read, edit, delete User B's reminder or repoint own reminder
+        rem_detail_b = reverse('reminder-detail', args=[self.rem_b.pk])
+        self.assertEqual(self.client.get(rem_detail_b).status_code, 404)
+        self.assertEqual(
+            self.client.patch(rem_detail_b, {'is_done': True}, format='json').status_code,
+            404,
+        )
+        self.assertEqual(self.client.delete(rem_detail_b).status_code, 404)
+        self.assertEqual(
+            self.client.patch(
+                reverse('reminder-detail', args=[rem_a.pk]),
+                {'application': str(self.app_b.pk)},
+                format='json',
+            ).status_code,
+            400,
+        )
+
+        # User A's analytics must count only User A's 1 application
+        analytics_resp = self.client.get(reverse('analytics'))
+        self.assertEqual(analytics_resp.status_code, 200)
+        self.assertEqual(analytics_resp.data['total_applications'], 1)
+
+    def test_mass_assignment_ignores_user_and_current_status(self):
+        self.client.force_authenticate(self.user_a)
+        resp = self.client.post(
+            reverse('application-list'),
+            {
+                'company_name': 'Acme',
+                'role_title': 'Backend Dev',
+                'channel': 'linkedin',
+                'user': self.user_b.pk,
+                'current_status': 'offer',
+            },
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 201)
+        created = Application.objects.get(pk=resp.data['id'])
+        self.assertEqual(created.user_id, self.user_a.id)
+        self.assertEqual(created.current_status, Application.Status.APPLIED)
+
+    def test_create_application_without_date_applied_uses_localdate_no_crash(self):
+        self.client.force_authenticate(self.user_a)
+        resp = self.client.post(
+            reverse('application-list'),
+            {'company_name': 'NoDate Co', 'role_title': 'SRE', 'channel': 'email'},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 201)
+        self.assertEqual(resp.data['days_since_applied'], 0)
+
+    def test_validation_rejects_negative_salary_oversized_notes_and_dangerous_schemes(self):
+        self.client.force_authenticate(self.user_a)
+        neg_salary = self.client.post(
+            reverse('application-list'),
+            {
+                'company_name': 'Co',
+                'role_title': 'Dev',
+                'channel': 'email',
+                'monthly_salary': '-10.00',
+            },
+            format='json',
+        )
+        self.assertEqual(neg_salary.status_code, 400)
+        self.assertIn('monthly_salary', neg_salary.data)
+
+        for bad_url in ['javascript:alert(1)', '  JavaScript:alert(1)', 'data:text/html,xss', 'vbscript:msgbox']:
+            bad_source = self.client.post(
+                reverse('application-list'),
+                {
+                    'company_name': 'Co',
+                    'role_title': 'Dev',
+                    'channel': 'email',
+                    'source_detail': bad_url,
+                },
+                format='json',
+            )
+            self.assertEqual(bad_source.status_code, 400, bad_url)
+
+        long_notes = self.client.post(
+            reverse('application-list'),
+            {
+                'company_name': 'Co',
+                'role_title': 'Dev',
+                'channel': 'email',
+                'notes': 'x' * 4001,
+            },
+            format='json',
+        )
+        self.assertEqual(long_notes.status_code, 400)
+
+        app = Application.objects.create(
+            user=self.user_a, company_name='Co', role_title='Dev', channel='email'
+        )
+        long_status_notes = self.client.post(
+            reverse('application-log-status', args=[app.pk]),
+            {'status': 'interview', 'notes': 'x' * 4001},
+            format='json',
+        )
+        self.assertEqual(long_status_notes.status_code, 400)
+
+    def test_removed_stale_endpoint_returns_404(self):
+        self.client.force_authenticate(self.user_a)
+        resp = self.client.get('/tracker/applications/stale/')
+        self.assertEqual(resp.status_code, 404)
