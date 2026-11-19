@@ -22,6 +22,10 @@ class UserManager(BaseUserManager):
             raise ValueError('Superuser must have is_superuser=True.')
         return self.create_user(email, password, **extra_fields)
 
+    def get_by_natural_key(self, username):
+        normalized = (username or "").strip()
+        return self.get(**{f"{self.model.USERNAME_FIELD}__iexact": normalized})
+
 
 class User(AbstractBaseUser, PermissionsMixin):
     email = models.EmailField(unique=True)
@@ -35,6 +39,16 @@ class User(AbstractBaseUser, PermissionsMixin):
     USERNAME_FIELD = "email"
     REQUIRED_FIELDS = []
     objects = UserManager()
+
+    def clean(self):
+        super().clean()
+        if self.email:
+            self.email = self.email.strip().lower()
+
+    def save(self, *args, **kwargs):
+        if self.email:
+            self.email = self.email.strip().lower()
+        return super().save(*args, **kwargs)
 
     def __str__(self):
         return self.email

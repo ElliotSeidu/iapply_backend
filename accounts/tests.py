@@ -1,8 +1,12 @@
 from datetime import timedelta
+import importlib
+from types import SimpleNamespace
 from unittest.mock import patch
 
+from django.apps import apps as django_apps
 from django.conf import settings
 from django.core.cache import cache
+from django.db import connection
 from django.test import TestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
@@ -221,6 +225,67 @@ class AccountSecurityRegressionTests(APITestCase):
 		self.assertEqual(resp.status_code, 200)
 		self.assertIn('access', resp.data)
 		self.assertIn('refresh', resp.data)
+
+	def test_user_stored_with_mixed_case_email_can_still_log_in(self):
+		User.objects.filter(pk=self.user.pk).update(email='Alice.Mixed@Example.COM')
+		for login_email in ('alice.mixed@example.com', '  ALICE.MIXED@example.com '):
+			resp = self.client.post(
+				reverse('login'),
+				{'email': login_email, 'password': 'StrongPassw0rd!'},
+				format='json',
+			)
+			self.assertEqual(resp.status_code, 200)
+			self.assertIn('access', resp.data)
+
+	def test_mixed_case_registration_of_existing_email_treated_as_same_account(self):
+		User.objects.filter(pk=self.user.pk).update(email='Alice.Stored@Example.COM')
+		initial_count = User.objects.count()
+		with patch('accounts.views.send_mail') as mock_mail:
+			resp = self.client.post(
+				reverse('register'),
+				{
+					'email': '  ALICE.STORED@example.com  ',
+					'password': 'UniquePassw0rd!99',
+					'password2': 'UniquePassw0rd!99',
+					'first_name': 'Alice',
+					'last_name': 'Dup',
+				},
+				format='json',
+			)
+		self.assertEqual(resp.status_code, 200)
+		self.assertEqual(resp.data, {'message': 'Verification code sent to email'})
+		self.assertEqual(User.objects.count(), initial_count)
+		self.assertFalse(
+			EmailVerification.objects.filter(email__iexact='alice.stored@example.com').exists()
+		)
+		mock_mail.assert_not_called()
+
+	def test_user_save_normalizes_email_to_lowercase(self):
+		direct = User(email='  DirectSave@Example.COM  ')
+		direct.set_password('StrongPassw0rd!')
+		direct.save()
+		direct.refresh_from_db()
+		self.assertEqual(direct.email, 'directsave@example.com')
+
+	def test_lowercase_user_emails_migration_normalizes_and_stops_on_duplicates(self):
+		migration_mod = importlib.import_module('accounts.migrations.0009_lowercase_user_emails')
+		schema_editor = SimpleNamespace(connection=connection)
+		User.objects.filter(pk=self.user.pk).update(email='Alice.PreMigration@Example.COM')
+
+		migration_mod.lowercase_user_emails(django_apps, schema_editor)
+		self.user.refresh_from_db()
+		self.assertEqual(self.user.email, 'alice.premigration@example.com')
+
+		# Create case-insensitive duplicate rows directly via bulk_create (bypassing save())
+		User.objects.bulk_create([
+			User(email='Dupe.User@Example.COM', password='x'),
+			User(email='dupe.user@example.com', password='x'),
+		])
+		with self.assertRaises(RuntimeError) as ctx:
+			migration_mod.lowercase_user_emails(django_apps, schema_editor)
+		self.assertIn('1 case-insensitive duplicate email group(s)', str(ctx.exception))
+		self.assertNotIn('@example.com', str(ctx.exception).lower())
+		self.assertTrue(User.objects.filter(email='Dupe.User@Example.COM').exists())
 
 	def test_registration_enumeration_response_and_work_parity(self):
 		payload_existing = {
@@ -613,6 +678,29 @@ class GoogleSignInSecurityTests(APITestCase):
 		self.assertEqual(conflict.status_code, 400)
 		existing.refresh_from_db()
 		self.assertEqual(existing.google_sub, 'sub-ada-1')
+
+	def test_google_login_matches_existing_account_regardless_of_case(self):
+		existing = User.objects.create_user(
+			email='case.match@example.com',
+			password='StrongPassw0rd!',
+			first_name='Grace',
+		)
+		User.objects.filter(pk=existing.pk).update(email='Case.Match@Example.COM')
+		initial_count = User.objects.count()
+		with patch(
+			'google.oauth2.id_token.verify_oauth2_token',
+			return_value=self._claims(
+				email='  CASE.MATCH@example.com  ',
+				sub='sub-case-match',
+				jti='jti-case-match',
+			),
+		):
+			resp = self.client.post(self.url, {'credential': 'tok-case'}, format='json')
+		self.assertEqual(resp.status_code, 200)
+		self.assertFalse(resp.data['created'])
+		self.assertEqual(User.objects.count(), initial_count)
+		existing.refresh_from_db()
+		self.assertEqual(existing.google_sub, 'sub-case-match')
 
 	def test_inactive_user_rejected_without_binding_sub(self):
 		inactive = User.objects.create_user(
