@@ -79,7 +79,13 @@ SECURE_CONTENT_TYPE_NOSNIFF = True
 if not DEBUG:
     SECURE_HSTS_SECONDS = config('SECURE_HSTS_SECONDS', default=31536000, cast=int)
     SECURE_HSTS_INCLUDE_SUBDOMAINS = config('SECURE_HSTS_INCLUDE_SUBDOMAINS', default=True, cast=bool)
+    # Set SECURE_HSTS_PRELOAD=False during initial staging rollout until HTTPS works on all subdomains.
     SECURE_HSTS_PRELOAD = config('SECURE_HSTS_PRELOAD', default=True, cast=bool)
+
+X_FRAME_OPTIONS = 'DENY'
+DATA_UPLOAD_MAX_MEMORY_SIZE = config('DATA_UPLOAD_MAX_MEMORY_SIZE', default=262144, cast=int)
+FILE_UPLOAD_MAX_MEMORY_SIZE = config('FILE_UPLOAD_MAX_MEMORY_SIZE', default=262144, cast=int)
+DATA_UPLOAD_MAX_NUMBER_FIELDS = 100
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -289,11 +295,14 @@ LOGGING = {
             'format': '{levelname} {asctime} {module} {message}',
             'style': '{',
         },
+        'json': {
+            '()': 'config.logging_utils.JsonFormatter',
+        },
     },
     'handlers': {
         'console': {
             'class': 'logging.StreamHandler',
-            'formatter': 'verbose',
+            'formatter': 'verbose' if DEBUG else 'json',
         },
     },
     'root': {
@@ -313,6 +322,11 @@ LOGGING = {
         },
     },
 }
+
+# Optional external error-tracking hook point (e.g. Sentry):
+# if SENTRY_DSN and not DEBUG:
+#     import sentry_sdk
+#     sentry_sdk.init(dsn=SENTRY_DSN, send_default_pii=False, environment=DEPLOYMENT_ENV)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Database
@@ -435,6 +449,7 @@ DEFAULT_FROM_EMAIL = config('DEFAULT_FROM_EMAIL', default='noreply@iapply.app')
 EMAIL_HOST = config('EMAIL_HOST', default='smtp.gmail.com')
 EMAIL_PORT = config('EMAIL_PORT', default=587, cast=int)
 EMAIL_USE_TLS = config('EMAIL_USE_TLS', default=True, cast=bool)
+EMAIL_USE_SSL = config('EMAIL_USE_SSL', default=False, cast=bool)
 EMAIL_HOST_USER = config('EMAIL_HOST_USER', default='')
 EMAIL_HOST_PASSWORD = config('EMAIL_HOST_PASSWORD', default='')
 EMAIL_TIMEOUT = config('EMAIL_TIMEOUT', default=10, cast=int)
@@ -450,6 +465,12 @@ _DISALLOWED_PROD_EMAIL_BACKENDS = {
 }
 
 if DEPLOYMENT_ENV == 'production':
+    if not ALLOWED_HOSTS or any(
+        host == '*' or host.startswith('*.') for host in ALLOWED_HOSTS
+    ):
+        raise ImproperlyConfigured(
+            'Production ALLOWED_HOSTS must explicitly list hostnames without wildcards.'
+        )
     if DB_ENGINE != 'postgres':
         raise ImproperlyConfigured('Production deployments must use PostgreSQL.')
     if config('DB_SSLMODE', default='require') not in {'require', 'verify-ca', 'verify-full'}:
@@ -463,13 +484,25 @@ if DEPLOYMENT_ENV == 'production':
     if CSP_REPORT_ONLY:
         raise ImproperlyConfigured('CSP_REPORT_ONLY must be False in production.')
     if not CORS_ALLOWED_ORIGINS or any(
-        origin.startswith('http://') for origin in CORS_ALLOWED_ORIGINS
+        '*' in origin or not origin.startswith('https://')
+        for origin in CORS_ALLOWED_ORIGINS
     ):
         raise ImproperlyConfigured(
-            'Production CORS_ALLOWED_ORIGINS must contain only HTTPS origins.'
+            'Production CORS_ALLOWED_ORIGINS must contain exact HTTPS origins without wildcards.'
+        )
+    if any(
+        '*' in origin or not origin.startswith('https://')
+        for origin in CSRF_TRUSTED_ORIGINS
+    ):
+        raise ImproperlyConfigured(
+            'Production CSRF_TRUSTED_ORIGINS must contain exact HTTPS origins without wildcards.'
         )
     if EMAIL_BACKEND in _DISALLOWED_PROD_EMAIL_BACKENDS:
         raise ImproperlyConfigured('Production email must use a real delivery backend.')
+    if EMAIL_BACKEND == 'django.core.mail.backends.smtp.EmailBackend' and not (
+        EMAIL_USE_TLS or EMAIL_USE_SSL
+    ):
+        raise ImproperlyConfigured('Production SMTP must enable TLS or SSL.')
     if not REDIS_URL:
         raise ImproperlyConfigured('REDIS_URL must be configured in production.')
     if not REDIS_URL.startswith('rediss://'):

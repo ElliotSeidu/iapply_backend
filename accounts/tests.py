@@ -1,5 +1,7 @@
 from datetime import timedelta
 import importlib
+import json
+import logging
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -514,6 +516,8 @@ class AccountSecurityRegressionTests(APITestCase):
 		csp = resp.headers.get('Content-Security-Policy', '')
 		self.assertIn("default-src 'none'", csp)
 		self.assertIn("frame-ancestors 'none'", csp)
+		self.assertNotIn("'unsafe-inline'", csp)
+		self.assertNotIn("'unsafe-eval'", csp)
 		self.assertIn('https://accounts.google.com/gsi/client', csp)
 		self.assertIn('https://accounts.google.com/gsi/style', csp)
 		self.assertIn('https://accounts.google.com/gsi/', csp)
@@ -1058,3 +1062,61 @@ class GoogleOnlyAccountDeletionTests(APITestCase):
 		):
 			resp = self.client.post(self.request_url, {}, format='json')
 		self.assertEqual(resp.status_code, 503)
+
+
+class ProductionConfigAndHealthTests(APITestCase):
+	def test_healthz_returns_ok_unauthenticated_with_security_headers(self):
+		resp = self.client.get(reverse('healthz'))
+		self.assertEqual(resp.status_code, 200)
+		self.assertEqual(resp.json(), {'status': 'ok'})
+		self.assertEqual(resp.headers.get('X-Frame-Options'), 'DENY')
+		self.assertEqual(resp.headers.get('X-Content-Type-Options'), 'nosniff')
+		self.assertIn("object-src 'none'", resp.headers.get('Content-Security-Policy', ''))
+
+	def test_readyz_reports_ready_or_503_without_leaking_internals(self):
+		ok = self.client.get(reverse('readyz'))
+		self.assertEqual(ok.status_code, 200)
+		self.assertEqual(ok.json(), {'status': 'ready'})
+
+		with patch('config.health.connection.cursor', side_effect=RuntimeError('pg auth failed secret')):
+			db_down = self.client.get(reverse('readyz'))
+		self.assertEqual(db_down.status_code, 503)
+		self.assertEqual(db_down.json(), {'status': 'unavailable'})
+		self.assertNotIn('pg auth failed secret', db_down.content.decode('utf-8'))
+
+		with override_settings(REDIS_URL='rediss://localhost:6379/1'), patch(
+			'config.health.cache.get', side_effect=ConnectionError('redis secret host down')
+		):
+			cache_down = self.client.get(reverse('readyz'))
+		self.assertEqual(cache_down.status_code, 503)
+		self.assertEqual(cache_down.json(), {'status': 'unavailable'})
+		self.assertNotIn('redis secret host down', cache_down.content.decode('utf-8'))
+
+	def test_oversized_json_request_body_rejected(self):
+		with override_settings(DATA_UPLOAD_MAX_MEMORY_SIZE=128):
+			resp = self.client.post(
+				reverse('login'),
+				{'email': 'a' * 300 + '@example.com', 'password': 'x'},
+				format='json',
+			)
+		self.assertIn(resp.status_code, (400, 413))
+
+	def test_json_log_formatter_outputs_single_line_structured_json(self):
+		from config.logging_utils import JsonFormatter
+
+		formatter = JsonFormatter()
+		record = logging.LogRecord(
+			name='accounts.tests',
+			level=logging.INFO,
+			pathname=__file__,
+			lineno=1,
+			msg='Login failed for %s',
+			args=('user_redacted',),
+			exc_info=None,
+		)
+		rendered = formatter.format(record)
+		parsed = json.loads(rendered)
+		self.assertEqual(parsed['level'], 'INFO')
+		self.assertEqual(parsed['logger'], 'accounts.tests')
+		self.assertEqual(parsed['message'], 'Login failed for user_redacted')
+		self.assertIn('timestamp', parsed)

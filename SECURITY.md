@@ -15,7 +15,21 @@
 
 ## Production configuration
 
-Set `DEPLOYMENT_ENV=production`, `DEBUG=False`, HTTPS-only settings, a real email backend, and `CSP_REPORT_ONLY=False`. The settings module rejects production configurations that use SQLite, non-TLS PostgreSQL, non-delivery email backends, insecure redirects, short `SECRET_KEY` values (< 50 chars), or report-only CSP.
+Set `DEPLOYMENT_ENV=production`, `DEBUG=False`, HTTPS-only settings, a real email backend, and `CSP_REPORT_ONLY=False`. The settings module rejects production configurations that use SQLite, non-TLS PostgreSQL, non-delivery or non-TLS email backends, insecure redirects, wildcard `ALLOWED_HOSTS`/`CORS_ALLOWED_ORIGINS`/`CSRF_TRUSTED_ORIGINS`, short `SECRET_KEY` values (< 50 chars), missing/non-TLS `REDIS_URL`, or report-only CSP.
+
+### Origin, HSTS, Request Limits & Static Files
+
+- **Hosts & CORS/CSRF:** `ALLOWED_HOSTS`, `CORS_ALLOWED_ORIGINS`, and `CSRF_TRUSTED_ORIGINS` forbid wildcards in production (`CORS` and `CSRF` require exact `https://` origins; cookies are not used for API auth and `CORS_ALLOW_CREDENTIALS = False`).
+- **HSTS preload:** `SECURE_HSTS_SECONDS` defaults to `31536000` (1 year), `SECURE_HSTS_INCLUDE_SUBDOMAINS=True`, and `SECURE_HSTS_PRELOAD=True` (yielding zero `manage.py check --deploy` warnings). Override `SECURE_HSTS_SECONDS=300` and `SECURE_HSTS_PRELOAD=False` during initial staging rollout until HTTPS is confirmed across the apex domain and every subdomain before submitting to `hstspreload.org`.
+- **Headers & CSP:** `config/middleware.py` sets `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: strict-origin-when-cross-origin`, `Permissions-Policy`, `Cross-Origin-Opener-Policy: same-origin-allow-popups` (for Google Identity Services popups), and strict CSP with no `'unsafe-inline'` or `'unsafe-eval'` on API routes (`'unsafe-inline'` in `style-src` is permitted only on Django Admin HTML templates).
+- **Body & upload limits:** `DATA_UPLOAD_MAX_MEMORY_SIZE` and `FILE_UPLOAD_MAX_MEMORY_SIZE` default to `262144` bytes (256 KiB); `DATA_UPLOAD_MAX_NUMBER_FIELDS = 100`.
+- **Static files & Admin:** Static assets (if exposing Django Admin) are served via WhiteNoise (`CompressedManifestStaticFilesStorage`). Override `ADMIN_URL` with an unpredictable path and restrict access at the reverse proxy/VPN with an IP allowlist and admin MFA/2FA.
+
+### Logging, Error Tracking & Health Probes
+
+- **Structured logs:** When `DEBUG=False`, logs emit single-line JSON via `config/logging_utils.py`. Never log passwords, JWTs, OTP codes, full email addresses, or raw request payloads. A commented Sentry SDK hook point lives in `config/settings.py` (with `send_default_pii=False`) for optional adoption.
+- **Health endpoints:** `GET /healthz` returns `{"status":"ok"}` (200, unauthenticated process check) and `GET /readyz` verifies DB and configured Redis connectivity (`{"status":"ready"}` 200 or `{"status":"unavailable"}` 503 with no internal details).
+- **Email authentication:** Production SMTP requires `EMAIL_USE_TLS=True` or `EMAIL_USE_SSL=True` and `EMAIL_TIMEOUT=10`. Configure DNS **SPF**, **DKIM**, and **DMARC** records for the sending domain before sending OTP emails in production.
 
 ### Database configuration (`DB_*` variables; `DATABASE_URL` is unused)
 

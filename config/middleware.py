@@ -18,13 +18,21 @@ class SecurityHeadersMiddleware:
     def __call__(self, request):
         response = self.get_response(request)
 
+        admin_prefix = '/' + (getattr(settings, 'ADMIN_URL', 'admin/') or 'admin/').lstrip('/')
+        is_admin_path = request.path.startswith(admin_prefix)
+        style_src = (
+            "style-src 'self' 'unsafe-inline' https://accounts.google.com/gsi/style"
+            if is_admin_path
+            else "style-src 'self' https://accounts.google.com/gsi/style"
+        )
+
         # Content-Security-Policy header
         # Prevents XSS, frame injection, and restricted asset loads
         csp_directives = [
             "default-src 'none'",
             "img-src 'self' data: https:",
-            "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://accounts.google.com/gsi/style",
-            "font-src 'self' https://fonts.gstatic.com data:",
+            style_src,
+            "font-src 'self' data:",
             # Exact Google Identity Services script URL required for Sign In with Google.
             "script-src 'self' https://accounts.google.com/gsi/client",
             # API calls to our own backend + Google Identity Services credential exchange.
@@ -34,6 +42,7 @@ class SecurityHeadersMiddleware:
             "frame-ancestors 'none'",
             "base-uri 'none'",
             "form-action 'self'",
+            "object-src 'none'",
         ]
         csp_header_value = "; ".join(csp_directives)
         csp_header_name = (
