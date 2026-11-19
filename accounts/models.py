@@ -6,7 +6,7 @@ class UserManager(BaseUserManager):
     def create_user(self, email, password=None, **extra_fields):
         if not email:
             raise ValueError("User's must have email address.")
-        email = self.normalize_email(email)
+        email = email.strip().lower()
         user = self.model(email=email, **extra_fields)
         user.set_password(password)
         user.save(using=self._db)
@@ -30,6 +30,7 @@ class User(AbstractBaseUser, PermissionsMixin):
     is_active = models.BooleanField(default=True)
     is_staff = models.BooleanField(default=False)
     date_joined = models.DateTimeField(auto_now_add=True)
+    google_sub = models.CharField(max_length=255, unique=True, null=True, blank=True)
 
     USERNAME_FIELD = "email"
     REQUIRED_FIELDS = []
@@ -53,6 +54,7 @@ class EmailVerification(models.Model):
     """
 
     MAX_ATTEMPTS = 5
+    EXPIRY_MINUTES = 10
 
     email = models.EmailField(db_index=True)
     # 256 chars: safely covers pbkdf2_sha256, bcrypt, and argon2 hash lengths.
@@ -75,11 +77,12 @@ class PasswordResetRequest(models.Model):
     Security properties:
     - Token is CSPRNG-generated and stored only as a Django-hashed value.
     - MAX_ATTEMPTS prevents brute-force; record is deleted after success or expiry.
-    - Expires after 15 minutes (shorter than email verification).
+    - Expires after 15 minutes.
     - Always responds with the same message to prevent user-enumeration.
     """
 
     MAX_ATTEMPTS = 5
+    EXPIRY_MINUTES = 10
     EXPIRY_MINUTES = 15
 
     email = models.EmailField(db_index=True)

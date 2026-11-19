@@ -1,21 +1,31 @@
+from datetime import timedelta
+import hashlib
 import secrets
 
 from django.conf import settings
 from django.contrib.auth.hashers import check_password, make_password
+from django.contrib.auth.password_validation import validate_password
+from django.core.cache import cache
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.core.mail import send_mail
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from django.utils import timezone
-from datetime import timedelta
 
 from rest_framework import generics, status
+from rest_framework.exceptions import ValidationError as DRFValidationError
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.token_blacklist.models import OutstandingToken
-from rest_framework_simplejwt.views import TokenObtainPairView
+from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
 
-from .google_auth import GoogleAuthError, split_google_name, verify_google_id_token
+from .google_auth import (
+    GoogleAuthError,
+    GoogleAuthServiceError,
+    split_google_name,
+    verify_google_id_token,
+)
 from .models import EmailVerification, PasswordResetRequest, User
 from .serializers import (
     ChangePasswordSerializer,
@@ -32,7 +42,9 @@ from .serializers import (
 from .throttles import (
     GoogleLoginRateThrottle,
     LoginRateThrottle,
+    PasswordActionRateThrottle,
     PasswordResetRateThrottle,
+    RefreshRateThrottle,
     RegisterRateThrottle,
     VerifyRateThrottle,
 )
@@ -42,10 +54,24 @@ def _is_dev_console():
     """True only for local development with the console email backend, where
     OTP codes are echoed to the terminal so no SMTP server is needed."""
     return (
-        getattr(settings, 'DEBUG', False)
-        and getattr(settings, 'DEPLOYMENT_ENV', 'development') != 'production'
+        getattr(settings, 'DEBUG', False) is True
+        and getattr(settings, 'DEPLOYMENT_ENV', 'production') == 'development'
         and getattr(settings, 'EMAIL_BACKEND', '') == 'django.core.mail.backends.console.EmailBackend'
     )
+
+
+def _consume_email_rate_limit(scope, email, limit=5, window=3600):
+    """Enforce a per-email rate limit across all IPs to prevent email bombing."""
+    digest = hashlib.sha256(email.encode('utf-8')).hexdigest()
+    key = f'email_rl:{scope}:{digest}'
+    if cache.add(key, 1, timeout=window):
+        return True
+    try:
+        count = cache.incr(key)
+    except ValueError:
+        cache.set(key, 1, timeout=window)
+        return True
+    return count <= limit
 
 
 def _blacklist_user_tokens(user):
@@ -66,12 +92,14 @@ class RegistrationView(APIView):
 
     Security notes:
     - Uses `secrets.randbelow` (CSPRNG) instead of `random` for OTP generation.
-    - Always returns HTTP 200 with the same message whether or not the email
-      already exists, to prevent user-enumeration via timing/response differences.
-    - Rate-limited to 5 requests per IP per hour to curb email-spam abuse.
+    - Always executes identical password-hashing work and returns HTTP 200 with
+      the same message whether or not the email already exists, preventing
+      user-enumeration via response or timing differences.
+    - Rate-limited per IP and per email to curb email-spam abuse.
     """
 
     permission_classes = [AllowAny]
+    authentication_classes = []
     throttle_classes = [RegisterRateThrottle]
 
     def post(self, request, *args, **kwargs):
@@ -79,7 +107,19 @@ class RegistrationView(APIView):
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
         email = data['email'].strip().lower()
+
+        if not _consume_email_rate_limit('register', email):
+            return Response(
+                {"message": "Too many requests for this email. Please try again later."},
+                status=status.HTTP_429_TOO_MANY_REQUESTS,
+            )
+
         is_dev_console = _is_dev_console()
+        # Hash password and OTP before checking user existence so existing and
+        # new emails spend equal CPU time (closes timing enumeration).
+        code = str(secrets.randbelow(900000) + 100000)
+        password_hash = make_password(data['password'])
+        code_hash = make_password(code)
 
         # Always return the same response whether or not the email is already
         # registered — avoids leaking which emails exist (user enumeration).
@@ -99,18 +139,15 @@ class RegistrationView(APIView):
 
         # Delete any previous pending verifications for this email so the
         # user isn't blocked by a stale record.
-        EmailVerification.objects.filter(email=email).delete()
-
-        # secrets.randbelow is cryptographically secure (unlike random.randint).
-        code = str(secrets.randbelow(900000) + 100000)
-        password_hash = make_password(data['password'])
-        EmailVerification.objects.create(
-            email=email,
-            code_hash=make_password(code),
-            password_hash=password_hash,
-            first_name=data.get('first_name', ''),
-            last_name=data.get('last_name', ''),
-        )
+        with transaction.atomic():
+            EmailVerification.objects.filter(email__iexact=email).delete()
+            EmailVerification.objects.create(
+                email=email,
+                code_hash=code_hash,
+                password_hash=password_hash,
+                first_name=(data.get('first_name') or '').strip(),
+                last_name=(data.get('last_name') or '').strip(),
+            )
         if is_dev_console:
             print(
                 f"\n{'=' * 64}\n"
@@ -151,6 +188,7 @@ class VerifyEmailView(APIView):
     """
 
     permission_classes = [AllowAny]
+    authentication_classes = []
     throttle_classes = [VerifyRateThrottle]
 
     def post(self, request, *args, **kwargs):
@@ -165,7 +203,7 @@ class VerifyEmailView(APIView):
             record = (
                 EmailVerification.objects
                 .select_for_update()
-                .filter(email=email)
+                .filter(email__iexact=email)
                 .order_by('-created_at')
                 .first()
             )
@@ -177,7 +215,7 @@ class VerifyEmailView(APIView):
                 )
 
             # Check expiry (10 minutes)
-            if timezone.now() > record.created_at + timedelta(minutes=10):
+            if timezone.now() > record.created_at + timedelta(minutes=EmailVerification.EXPIRY_MINUTES):
                 record.delete()
                 return Response(
                     {"message": "Code has expired. Please register again."},
@@ -194,25 +232,25 @@ class VerifyEmailView(APIView):
                     status=status.HTTP_429_TOO_MANY_REQUESTS,
                 )
 
-            # Wrong code — increment attempt counter and persist
+            # Wrong code — increment attempt counter and delete immediately once exhausted.
             if not check_password(code, record.code_hash):
                 record.attempts += 1
+                if record.attempts >= EmailVerification.MAX_ATTEMPTS:
+                    record.delete()
+                    return Response(
+                        {"message": "No attempts remaining. Please register again."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
                 record.save(update_fields=['attempts'])
                 remaining = EmailVerification.MAX_ATTEMPTS - record.attempts
                 return Response(
-                    {
-                        "message": (
-                            f"Incorrect code. {remaining} attempt(s) remaining."
-                            if remaining > 0
-                            else "No attempts remaining. Please register again."
-                        )
-                    },
+                    {"message": f"Incorrect code. {remaining} attempt(s) remaining."},
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
             # Guard against the email being registered between the registration
-            # request and now (e.g. via a different verification flow in parallel).
-            if User.objects.filter(email=email).exists():
+            # request and now (e.g. via Google sign-in in parallel).
+            if User.objects.filter(email__iexact=email).exists():
                 record.delete()
                 return Response(
                     {"message": "An account with this email already exists."},
@@ -226,7 +264,14 @@ class VerifyEmailView(APIView):
                 last_name=record.last_name,
             )
             user.password = record.password_hash
-            user.save()
+            try:
+                user.save()
+            except IntegrityError:
+                record.delete()
+                return Response(
+                    {"message": "An account with this email already exists."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
 
             # Clean up the verification record — it has served its purpose.
             record.delete()
@@ -252,23 +297,40 @@ class MyTokenObtainPairView(TokenObtainPairView):
     throttle_classes = [LoginRateThrottle]
 
 
+class MyTokenRefreshView(TokenRefreshView):
+    """Refresh endpoint — rate-limited to 30 attempts per IP per hour."""
+
+    throttle_classes = [RefreshRateThrottle]
+
+
 class PasswordResetRequestView(APIView):
     permission_classes = [AllowAny]
+    authentication_classes = []
     throttle_classes = [PasswordResetRateThrottle]
 
     def post(self, request, *args, **kwargs):
         serializer = PasswordResetRequestSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         email = serializer.validated_data['email'].strip().lower()
+
+        if not _consume_email_rate_limit('password_reset', email):
+            return Response(
+                {"message": "Too many requests for this email. Please try again later."},
+                status=status.HTTP_429_TOO_MANY_REQUESTS,
+            )
+
+        # Compute OTP and hash before looking up user to avoid timing leaks.
+        code = str(secrets.randbelow(900000) + 100000)
+        code_hash = make_password(code)
         user = User.objects.filter(email__iexact=email, is_active=True).first()
 
         if user:
-            PasswordResetRequest.objects.filter(email=email).delete()
-            code = str(secrets.randbelow(900000) + 100000)
-            PasswordResetRequest.objects.create(
-                email=email,
-                code_hash=make_password(code),
-            )
+            with transaction.atomic():
+                PasswordResetRequest.objects.filter(email__iexact=email).delete()
+                PasswordResetRequest.objects.create(
+                    email=email,
+                    code_hash=code_hash,
+                )
             if _is_dev_console():
                 print(
                     f"\n{'=' * 64}\n"
@@ -298,6 +360,7 @@ class PasswordResetRequestView(APIView):
 
 class PasswordResetConfirmView(APIView):
     permission_classes = [AllowAny]
+    authentication_classes = []
     throttle_classes = [VerifyRateThrottle]
 
     def post(self, request, *args, **kwargs):
@@ -309,7 +372,7 @@ class PasswordResetConfirmView(APIView):
             record = (
                 PasswordResetRequest.objects
                 .select_for_update()
-                .filter(email=email)
+                .filter(email__iexact=email)
                 .order_by('-created_at')
                 .first()
             )
@@ -333,6 +396,12 @@ class PasswordResetConfirmView(APIView):
                 )
             if not check_password(serializer.validated_data['code'], record.code_hash):
                 record.attempts += 1
+                if record.attempts >= PasswordResetRequest.MAX_ATTEMPTS:
+                    record.delete()
+                    return Response(
+                        {"message": "No attempts remaining. Please request a new code."},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
                 record.save(update_fields=['attempts'])
                 remaining = PasswordResetRequest.MAX_ATTEMPTS - record.attempts
                 return Response(
@@ -347,9 +416,16 @@ class PasswordResetConfirmView(APIView):
                     {"message": "Invalid or expired code. Please request a new one."},
                     status=status.HTTP_400_BAD_REQUEST,
                 )
+
+            try:
+                validate_password(serializer.validated_data['password'], user=user)
+            except DjangoValidationError as exc:
+                raise DRFValidationError({"password": list(exc.messages)})
+
             user.set_password(serializer.validated_data['password'])
             user.save(update_fields=['password'])
             record.delete()
+            EmailVerification.objects.filter(email__iexact=email).delete()
 
         _blacklist_user_tokens(user)
 
@@ -391,9 +467,13 @@ class LogoutView(APIView):
 
 class ChangePasswordView(APIView):
     permission_classes = [IsAuthenticated]
+    throttle_classes = [PasswordActionRateThrottle]
 
     def patch(self, request, *args, **kwargs):
-        serializer = ChangePasswordSerializer(data=request.data)
+        serializer = ChangePasswordSerializer(
+            data=request.data,
+            context={'user': request.user},
+        )
         serializer.is_valid(raise_exception=True)
         user = request.user
         # Google-only accounts have an unusable password (set_unusable_password).
@@ -412,7 +492,9 @@ class ChangePasswordView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
         user.set_password(serializer.validated_data['new_password'])
-        user.save()
+        user.save(update_fields=['password'])
+        # Pending password-reset OTPs must not survive a password change.
+        PasswordResetRequest.objects.filter(email__iexact=user.email).delete()
         _blacklist_user_tokens(user)
         return Response(
             {"message": "Password updated successfully."},
@@ -422,6 +504,7 @@ class ChangePasswordView(APIView):
 
 class DeleteAccountView(generics.DestroyAPIView):
     permission_classes = [IsAuthenticated]
+    throttle_classes = [PasswordActionRateThrottle]
 
     def delete(self, request, *args, **kwargs):
         serializer = DeleteAccountSerializer(data=request.data)
@@ -436,8 +519,11 @@ class DeleteAccountView(generics.DestroyAPIView):
                     {"message": "Invalid password."},
                     status=status.HTTP_401_UNAUTHORIZED,
                 )
-        _blacklist_user_tokens(user)
-        user.delete()
+        with transaction.atomic():
+            _blacklist_user_tokens(user)
+            EmailVerification.objects.filter(email__iexact=user.email).delete()
+            PasswordResetRequest.objects.filter(email__iexact=user.email).delete()
+            user.delete()
         return Response(
             {"message": "Account deleted successfully."},
             status=status.HTTP_200_OK,
@@ -451,10 +537,11 @@ class GoogleLoginView(APIView):
     Security notes:
     - The ID token is verified server-side against Google's public keys with the
       audience pinned to GOOGLE_CLIENT_ID; no client-supplied email is trusted.
-    - `email_verified` must be true. Without that check an unverified Google
-      address could be used to take over an existing account.
-    - Accounts are matched on email, so someone who registered with a password
-      can later use Google with the same (now Google-verified) address.
+    - `email_verified` must be strictly True. Without that check an unverified
+      Google address could be used to take over an existing account.
+    - Users are matched primarily by Google's stable `sub` identifier and linked
+      by verified email on first Google sign-in; conflicting `sub` values are
+      rejected.
     - Rate-limited to 10 attempts per IP per hour.
     - Every credential failure returns one generic message, so the endpoint
       cannot be used to probe which emails or Google accounts exist.
@@ -470,47 +557,67 @@ class GoogleLoginView(APIView):
 
         try:
             info = verify_google_id_token(serializer.validated_data['credential'])
-        except GoogleAuthError as exc:
-            # A missing GOOGLE_CLIENT_ID / google-auth install is a *server*
-            # problem, not a bad credential, so report it distinctly (503) and
-            # let it fail loudly in ops instead of looking like a user error.
-            if 'not configured' in str(exc) or 'missing the google-auth' in str(exc):
-                return Response(
-                    {'message': 'Google sign-in is not available right now.'},
-                    status=status.HTTP_503_SERVICE_UNAVAILABLE,
-                )
+        except GoogleAuthServiceError:
+            return Response(
+                {'message': 'Google sign-in is not available right now.'},
+                status=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )
+        except GoogleAuthError:
             return Response(
                 {'message': 'Could not verify that Google account. Please try again.'},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
         email = info['email']
+        google_sub = info['google_sub']
         first_name, last_name = split_google_name(info)
 
-        with transaction.atomic():
-            user = User.objects.filter(email__iexact=email).first()
-            created = False
+        inactive_or_mismatch = False
+        created = False
 
-            if user is None:
-                # set_unusable_password(): Google-only until the user explicitly
-                # sets a password, so the account can never be entered with a
-                # blank or guessed password.
-                user = User(
-                    email=email,
-                    first_name=first_name[:150],
-                    last_name=last_name[:150],
-                )
-                user.set_unusable_password()
-                user.save()
-                created = True
+        try:
+            with transaction.atomic():
+                user = User.objects.select_for_update().filter(google_sub=google_sub).first()
 
-            # A Google-verified address proves ownership, so any half-finished
-            # email-verification record for it is now redundant.
-            EmailVerification.objects.filter(email__iexact=email).delete()
+                if user is None:
+                    user = User.objects.select_for_update().filter(email__iexact=email).first()
+                    if user is not None:
+                        if user.google_sub and user.google_sub != google_sub:
+                            inactive_or_mismatch = True
+                        elif not user.is_active:
+                            inactive_or_mismatch = True
+                        else:
+                            user.google_sub = google_sub
+                            user.save(update_fields=['google_sub'])
+                    else:
+                        # set_unusable_password(): Google-only until the user explicitly
+                        # sets a password, so the account can never be entered with a
+                        # blank or guessed password.
+                        user = User(
+                            email=email,
+                            first_name=first_name[:150],
+                            last_name=last_name[:150],
+                            google_sub=google_sub,
+                        )
+                        user.set_unusable_password()
+                        user.save()
+                        created = True
+                elif not user.is_active:
+                    inactive_or_mismatch = True
 
-        if not user.is_active:
+                if not inactive_or_mismatch:
+                    # A Google-verified address proves ownership, so any half-finished
+                    # email-verification record for it is now redundant.
+                    EmailVerification.objects.filter(email__iexact=email).delete()
+        except IntegrityError:
+            return Response(
+                {'message': 'Could not verify that Google account. Please try again.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if inactive_or_mismatch or user is None:
             # Same generic message as an invalid token — do not reveal that the
-            # account exists but is disabled.
+            # account exists, is disabled, or conflicts on Google subject ID.
             return Response(
                 {'message': 'Could not verify that Google account. Please try again.'},
                 status=status.HTTP_400_BAD_REQUEST,

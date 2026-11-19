@@ -1,42 +1,27 @@
-from rest_framework import serializers
-from .models import User
 from django.contrib.auth.password_validation import validate_password
+from rest_framework import serializers
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 from rest_framework_simplejwt.tokens import RefreshToken
 
-
-class RegistrationSerializer(serializers.ModelSerializer):
-    password2 = serializers.CharField(write_only=True)
-
-    def validate(self, attrs):
-        if attrs['password'] != attrs['password2']:
-            raise serializers.ValidationError({"password2": "The passwords don't match"})
-        validate_password(attrs['password'])
-        return attrs
-
-    def create(self, validated_data):
-        validated_data.pop("password2")
-        return User.objects.create_user(**validated_data)
-
-    class Meta:
-        model = User
-        extra_kwargs = {
-            "password": {"write_only": True}
-        }
-        fields = ["email", "first_name", "last_name", "password", "password2"]
+from .models import User
 
 
 class VerificationRequestSerializer(serializers.Serializer):
     email = serializers.EmailField()
     first_name = serializers.CharField(max_length=150, allow_blank=True, required=False)
     last_name = serializers.CharField(max_length=150, allow_blank=True, required=False)
-    password = serializers.CharField(write_only=True)
-    password2 = serializers.CharField(write_only=True)
+    password = serializers.CharField(write_only=True, max_length=128)
+    password2 = serializers.CharField(write_only=True, max_length=128)
 
     def validate(self, attrs):
         if attrs['password'] != attrs['password2']:
             raise serializers.ValidationError({"password2": "The passwords don't match"})
-        validate_password(attrs['password'])
+        candidate = User(
+            email=attrs['email'].strip().lower(),
+            first_name=(attrs.get('first_name') or '').strip(),
+            last_name=(attrs.get('last_name') or '').strip(),
+        )
+        validate_password(attrs['password'], user=candidate)
         return attrs
 
 
@@ -62,8 +47,8 @@ class PasswordResetConfirmSerializer(serializers.Serializer):
         regex=r'^\d{6}$',
         error_messages={'invalid': 'Enter the 6-digit code from your email.'},
     )
-    password = serializers.CharField(write_only=True)
-    password2 = serializers.CharField(write_only=True)
+    password = serializers.CharField(write_only=True, max_length=128)
+    password2 = serializers.CharField(write_only=True, max_length=128)
 
     def validate(self, attrs):
         if attrs['password'] != attrs['password2']:
@@ -74,6 +59,13 @@ class PasswordResetConfirmSerializer(serializers.Serializer):
 
 class MyTokenObtainPairSerializer(TokenObtainPairSerializer):
     def validate(self, attrs):
+        attrs[self.username_field] = (attrs.get(self.username_field) or '').strip().lower()
+        password = attrs.get('password') or ''
+        if len(password) > 128:
+            raise serializers.ValidationError(
+                self.error_messages['no_active_account'],
+                code='no_active_account',
+            )
         data = super().validate(attrs)
         data['email'] = self.user.email
         data['first_name'] = self.user.first_name
@@ -90,6 +82,12 @@ class UserSerializer(serializers.ModelSerializer):
 
     def get_has_password(self, obj):
         return obj.has_usable_password()
+
+    def validate_first_name(self, value):
+        return value.strip()
+
+    def validate_last_name(self, value):
+        return value.strip()
 
     class Meta:
         model = User
@@ -122,21 +120,27 @@ class LogoutSerializer(serializers.Serializer):
 
 
 class ChangePasswordSerializer(serializers.Serializer):
-    old_password = serializers.CharField(write_only=True)
-    new_password = serializers.CharField(write_only=True)
-    new_password2 = serializers.CharField(write_only=True)
+    old_password = serializers.CharField(write_only=True, max_length=128)
+    new_password = serializers.CharField(write_only=True, max_length=128)
+    new_password2 = serializers.CharField(write_only=True, max_length=128)
 
     def validate(self, attrs):
         if attrs['new_password'] != attrs['new_password2']:
             raise serializers.ValidationError("The passwords do not match")
-        validate_password(attrs['new_password'])
+        if attrs['new_password'] == attrs['old_password']:
+            raise serializers.ValidationError(
+                {"new_password": "New password must be different from your current password."}
+            )
+        validate_password(attrs['new_password'], user=self.context.get('user'))
         return attrs
 
 
 class DeleteAccountSerializer(serializers.Serializer):
     # Optional so Google-only accounts (no usable password) can delete their
     # account. The view still enforces the password for password accounts.
-    password = serializers.CharField(write_only=True, required=False, allow_blank=True, default='')
+    password = serializers.CharField(
+        write_only=True, required=False, allow_blank=True, default='', max_length=128
+    )
 
 
 class GoogleLoginSerializer(serializers.Serializer):
@@ -150,6 +154,7 @@ class GoogleLoginSerializer(serializers.Serializer):
 
     credential = serializers.CharField(
         write_only=True,
+        max_length=4096,
         trim_whitespace=True,
         error_messages={
             'blank': 'A Google credential is required.',

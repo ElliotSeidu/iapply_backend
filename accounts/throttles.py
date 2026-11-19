@@ -3,13 +3,13 @@ Custom per-endpoint throttle classes.
 
 Why not just rely on the global anon/user throttles in settings?
   - Auth endpoints are unauthenticated, so they share the global `anon` bucket
-    (30/hour) across ALL anonymous users. That means a single attacker reaching
+    (60/hour) across ALL anonymous users. That means a single attacker reaching
     the limit would block every genuine visitor.
   - These scoped throttles give each IP address its own independent bucket, at
     much stricter rates, for the endpoints that matter most for credential abuse.
 """
 
-from rest_framework.throttling import AnonRateThrottle
+from rest_framework.throttling import AnonRateThrottle, UserRateThrottle
 
 
 class LoginRateThrottle(AnonRateThrottle):
@@ -51,3 +51,13 @@ class GoogleLoginRateThrottle(AnonRateThrottle):
     this also stops the endpoint being used as an outbound-request amplifier.
     """
     scope = 'google_login'
+
+
+class RefreshRateThrottle(AnonRateThrottle):
+    """30 token refresh attempts per IP per hour."""
+    scope = 'token_refresh'
+
+
+class PasswordActionRateThrottle(UserRateThrottle):
+    """10 sensitive password/account-deletion attempts per user per hour."""
+    scope = 'password_action'

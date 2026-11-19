@@ -14,15 +14,24 @@ only trusted source of identity is the signature-verified token. That is what
 makes this safe against a client that simply posts `{"email": "ceo@company.com"}`.
 """
 
+import hashlib
 import logging
+import time
 
 from django.conf import settings
+from django.core.cache import cache
 
 logger = logging.getLogger(__name__)
+
+_GOOGLE_ISSUERS = frozenset({'accounts.google.com', 'https://accounts.google.com'})
 
 
 class GoogleAuthError(Exception):
     """Raised when a Google ID token cannot be trusted."""
+
+
+class GoogleAuthServiceError(GoogleAuthError):
+    """Raised when Google Sign-In is unconfigured or Google's certs cannot be reached."""
 
 
 def get_google_client_id():
@@ -34,19 +43,21 @@ def verify_google_id_token(id_token):
     """
     Verify a Google ID token and return the safe subset of its claims.
 
-    Raises GoogleAuthError (never a library-specific exception) so callers can
-    map every failure to a single generic client-facing message.
+    Raises GoogleAuthServiceError for server/upstream availability errors and
+    GoogleAuthError for invalid, unverified, or replayed credentials so callers
+    can map every credential failure to a single generic client-facing message.
     """
     client_id = get_google_client_id()
     if not client_id:
         # Misconfiguration, not a bad user token — surfaced as 503 by the view.
-        raise GoogleAuthError('GOOGLE_CLIENT_ID is not configured on the server.')
+        raise GoogleAuthServiceError('GOOGLE_CLIENT_ID is not configured on the server.')
 
     try:
+        from google.auth import exceptions as google_exceptions
         from google.auth.transport import requests as google_requests
         from google.oauth2 import id_token as google_id_token
     except ImportError as exc:  # pragma: no cover - depends on install
-        raise GoogleAuthError(
+        raise GoogleAuthServiceError(
             'Server is missing the google-auth dependency.'
         ) from exc
 
@@ -59,21 +70,42 @@ def verify_google_id_token(id_token):
             google_requests.Request(),
             client_id,
         )
-    except ValueError as exc:
-        # google-auth raises ValueError for every verification failure.
-        # Log the reason server-side, return nothing specific to the client.
+    except google_exceptions.TransportError as exc:
+        logger.warning('Google cert fetch failed during ID token verification: %s', exc)
+        raise GoogleAuthServiceError('Could not reach Google to verify credential.') from exc
+    except (ValueError, KeyError, google_exceptions.GoogleAuthError) as exc:
+        # Log only the failure reason server-side (never the raw token).
         logger.warning('Google ID token verification failed: %s', exc)
         raise GoogleAuthError('Invalid Google credential.') from exc
+
+    if claims.get('iss') not in _GOOGLE_ISSUERS:
+        raise GoogleAuthError('Invalid Google token issuer.')
+
+    if claims.get('aud') != client_id:
+        raise GoogleAuthError('Invalid Google token audience.')
+
+    # Google only sets boolean True for addresses it has actually verified.
+    if claims.get('email_verified') is not True:
+        raise GoogleAuthError('Google account email address is not verified.')
+
+    google_sub = (claims.get('sub') or '').strip()
+    if not google_sub:
+        raise GoogleAuthError('Google account did not provide a subject identifier.')
 
     email = (claims.get('email') or '').strip().lower()
     if not email:
         raise GoogleAuthError('Google account did not provide an email address.')
 
-    # Google only sets this for addresses it has actually verified. Without it we
-    # would be trusting an unverified address, which would let someone claim an
-    # account they do not own.
-    if not claims.get('email_verified'):
-        raise GoogleAuthError('Google account email address is not verified.')
+    # Enforce single-use replay protection only after signature and claims validate.
+    replay_seed = str(claims.get('jti') or id_token)
+    digest = hashlib.sha256(replay_seed.encode('utf-8')).hexdigest()
+    exp = claims.get('exp')
+    if isinstance(exp, (int, float)):
+        ttl = max(60, min(3600, int(exp - time.time())))
+    else:
+        ttl = 3600
+    if not cache.add(f'google_id_token_used:{digest}', 1, timeout=ttl):
+        raise GoogleAuthError('Google credential has already been used.')
 
     return {
         'email': email,
@@ -81,7 +113,7 @@ def verify_google_id_token(id_token):
         'first_name': (claims.get('given_name') or '').strip(),
         'last_name': (claims.get('family_name') or '').strip(),
         'full_name': (claims.get('name') or '').strip(),
-        'google_sub': claims.get('sub') or '',
+        'google_sub': google_sub,
         'picture': claims.get('picture') or '',
     }
 
