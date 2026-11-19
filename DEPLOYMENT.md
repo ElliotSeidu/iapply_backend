@@ -75,3 +75,16 @@ python manage.py test
    ```bash
    pg_restore --clean --if-exists --no-owner --no-acl -d "$DATABASE_URL" iapply_predeploy_<timestamp>.dump
    ```
+
+## Running in Production (Gunicorn & Static Files)
+
+`manage.py runserver` and `DEBUG=True` are **prohibited** in production. Serve the WSGI application with Gunicorn using the checked-in `gunicorn.conf.py`:
+
+```bash
+python manage.py collectstatic --noinput
+gunicorn -c gunicorn.conf.py config.wsgi:application
+```
+
+- `gunicorn.conf.py` binds to `GUNICORN_BIND` (default `0.0.0.0:$PORT`, fallback port `8000`), uses bounded `workers` (`WEB_CONCURRENCY`, 1–16) and `gthread` `threads` (`GUNICORN_THREADS`, 1–8), sets `timeout = 30`, `graceful_timeout = 30`, `keepalive = 5`, `max_requests = 1000` (`jitter = 100`), caps request header/line limits (`limit_request_line = 4094`, `limit_request_fields = 64`, `limit_request_field_size = 4096`), and writes access/error logs to stdout/stderr.
+- Ensure your reverse proxy (e.g., nginx, platform router) enforces HTTPS redirect, forwards `X-Forwarded-For` / `X-Forwarded-Proto` matching `NUM_PROXIES` and `TRUST_PROXY_SSL_HEADER`, and serves `STATIC_ROOT` (`staticfiles/`) if Django Admin is enabled (or keep Django Admin restricted/disabled in production).
+
