@@ -23,6 +23,16 @@ Google ID-token replay checking and marking **fail closed** (returning HTTP 503)
 
 Set `NUM_PROXIES` and `TRUST_PROXY_SSL_HEADER` to match your reverse-proxy topology, and override `ADMIN_URL` if exposing Django Admin.
 
+### Reverse proxy and client IP throttling (`NUM_PROXIES`)
+
+DRF per-IP rate limiting derives the client IP using `REST_FRAMEWORK['NUM_PROXIES']` (configured in `config/settings.py` as `1 if not DEBUG else 0` when `NUM_PROXIES` is unset):
+
+- **Development (`DEBUG=True`)**: defaults to `0` (`X-Forwarded-For` is ignored; `REMOTE_ADDR` is used). Local test runs also evaluate `NUM_PROXIES` at settings import time from `.env` (`0` when `.env` sets `DEBUG=True`, `1` when `DEBUG=False`).
+- **Production (`DEBUG=False`)**: defaults to `1` (trusts only the single rightmost `X-Forwarded-For` hop appended by one reverse proxy).
+- **Choosing the exact value for your host**: set `NUM_PROXIES` to the exact number of trusted proxies/load balancers/CDNs between the browser and Django that append client IPs to `X-Forwarded-For` (commonly `1` behind a platform router/nginx/Cloud Run, `2` behind CDN + load balancer, `0` if Django accepts direct traffic).
+  - **Too low** (e.g. `0` behind a proxy, or `1` behind 2 proxies): all traffic shares the proxy's IP throttle bucket, causing unrelated users to throttle one another.
+  - **Too high** (e.g. `1` with no proxy, or `2` behind only 1 proxy): attackers can forge leftmost `X-Forwarded-For` values to evade per-IP login and OTP throttles.
+
 Before publishing, run:
 
 ```text

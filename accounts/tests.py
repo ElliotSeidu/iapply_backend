@@ -478,9 +478,18 @@ class AccountSecurityRegressionTests(APITestCase):
 				login_url,
 				{'email': self.user.email, 'password': 'WrongPassword!1'},
 				format='json',
-				HTTP_X_FORWARDED_FOR='198.51.100.250, 192.0.2.50',
+				HTTP_X_FORWARDED_FOR='10.0.0.1, 198.51.100.250, 192.0.2.50',
 			)
 			self.assertEqual(throttled.status_code, 429)
+
+			# A distinct rightmost client IP still has its own independent bucket.
+			other_client = self.client.post(
+				login_url,
+				{'email': self.user.email, 'password': 'WrongPassword!1'},
+				format='json',
+				HTTP_X_FORWARDED_FOR='198.51.100.250, 192.0.2.99',
+			)
+			self.assertEqual(other_client.status_code, 401)
 
 	def test_per_email_rate_limit_blocks_distributed_email_bombing(self):
 		with patch('accounts.views.send_mail'):
