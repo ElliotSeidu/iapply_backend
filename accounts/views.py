@@ -28,7 +28,7 @@ from .google_auth import (
     split_google_name,
     verify_google_id_token,
 )
-from .models import EmailVerification, PasswordResetRequest, User
+from .models import AccountDeletionRequest, EmailVerification, PasswordResetRequest, User
 from .serializers import (
     ChangePasswordSerializer,
     DeleteAccountSerializer,
@@ -514,6 +514,106 @@ class ChangePasswordView(APIView):
         )
 
 
+def _consume_account_deletion_code(user, code):
+    """Validate and consume a Google-only account's deletion OTP inside an atomic block.
+
+    Returns None on success or an error Response on invalid/expired/exhausted code.
+    """
+    record = (
+        AccountDeletionRequest.objects
+        .select_for_update()
+        .filter(user_id=user.pk)
+        .order_by('-created_at')
+        .first()
+    )
+    if not record:
+        return Response(
+            {"message": "Invalid or expired code. Please request a new one."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    if timezone.now() > record.created_at + timedelta(minutes=AccountDeletionRequest.EXPIRY_MINUTES):
+        record.delete()
+        return Response(
+            {"message": "Code has expired. Please request a new one."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    if record.attempts >= AccountDeletionRequest.MAX_ATTEMPTS:
+        record.delete()
+        return Response(
+            {"message": "Too many incorrect attempts. Please request a new code."},
+            status=status.HTTP_429_TOO_MANY_REQUESTS,
+        )
+    if not check_password(code, record.code_hash):
+        record.attempts += 1
+        if record.attempts >= AccountDeletionRequest.MAX_ATTEMPTS:
+            record.delete()
+            return Response(
+                {"message": "No attempts remaining. Please request a new code."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        record.save(update_fields=['attempts'])
+        remaining = AccountDeletionRequest.MAX_ATTEMPTS - record.attempts
+        return Response(
+            {"message": f"Incorrect code. {remaining} attempt(s) remaining."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    record.delete()
+    return None
+
+
+class DeleteAccountRequestView(APIView):
+    """Email a 6-digit single-use deletion code for accounts without a password."""
+
+    permission_classes = [IsAuthenticated]
+    throttle_classes = [PasswordActionRateThrottle]
+
+    def post(self, request, *args, **kwargs):
+        user = request.user
+        if user.has_usable_password():
+            return Response(
+                {"message": "Password accounts confirm deletion using their password."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if not _consume_email_rate_limit('delete_account', user.email, limit=5, window=3600):
+            return Response(
+                {"message": "Too many requests for this email. Please try again later."},
+                status=status.HTTP_429_TOO_MANY_REQUESTS,
+            )
+
+        code = str(secrets.randbelow(900000) + 100000)
+        code_hash = make_password(code)
+        with transaction.atomic():
+            AccountDeletionRequest.objects.filter(user_id=user.pk).delete()
+            AccountDeletionRequest.objects.create(user=user, code_hash=code_hash)
+
+        if _is_dev_console():
+            print(
+                f"\n{'=' * 64}\n"
+                f"  [iApply OTP] Account Deletion Code\n"
+                f"  To:   {user.email}\n"
+                f"  Code: {code}\n"
+                f"{'=' * 64}\n",
+                flush=True,
+            )
+        send_mail(
+            subject='Your iApply account deletion code',
+            message=(
+                f'Your iApply account deletion verification code is: {code}\n\n'
+                f'This code expires in {AccountDeletionRequest.EXPIRY_MINUTES} minutes. '
+                'If you did not request to delete your account, ignore this email '
+                'and review your account security.'
+            ),
+            from_email=getattr(settings, 'DEFAULT_FROM_EMAIL', None),
+            recipient_list=[user.email],
+            fail_silently=True,
+        )
+        return Response(
+            {"message": "Verification code sent to your email."},
+            status=status.HTTP_200_OK,
+        )
+
+
 class DeleteAccountView(generics.DestroyAPIView):
     permission_classes = [IsAuthenticated]
     throttle_classes = [PasswordActionRateThrottle]
@@ -522,16 +622,26 @@ class DeleteAccountView(generics.DestroyAPIView):
         serializer = DeleteAccountSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         user = request.user
-        # Google-only accounts have an unusable password; skip the password check.
-        # The user is already authenticated with a valid JWT, which is sufficient
-        # proof of identity for account deletion in this case.
         if user.has_usable_password():
             if not user.check_password(serializer.validated_data['password']):
                 return Response(
                     {"message": "Invalid password."},
                     status=status.HTTP_401_UNAUTHORIZED,
                 )
+        else:
+            code = (serializer.validated_data.get('code') or '').strip()
+            if not code:
+                return Response(
+                    {"message": "Enter the 6-digit verification code sent to your email."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
         with transaction.atomic():
+            if not user.has_usable_password():
+                error_response = _consume_account_deletion_code(user, code)
+                if error_response is not None:
+                    return error_response
+            AccountDeletionRequest.objects.filter(user_id=user.pk).delete()
             _blacklist_user_tokens(user)
             EmailVerification.objects.filter(email__iexact=user.email).delete()
             PasswordResetRequest.objects.filter(email__iexact=user.email).delete()

@@ -88,10 +88,10 @@ class GoogleOnlyAccountTests(APITestCase):
         self.assertEqual(resp.status_code, 400)
         self.assertIn('Google', resp.data['message'])
 
-    def test_can_delete_account_without_password(self):
+    def test_cannot_delete_account_without_otp_code(self):
         resp = self.client.delete(reverse('delete-account'), {}, format='json')
-        self.assertEqual(resp.status_code, 200)
-        self.assertFalse(User.objects.filter(email='g@example.com').exists())
+        self.assertEqual(resp.status_code, 400)
+        self.assertTrue(User.objects.filter(email='g@example.com').exists())
 
     def test_password_user_still_needs_password_to_delete(self):
         u = User.objects.create_user(email='p@example.com', password='StrongPassw0rd!')

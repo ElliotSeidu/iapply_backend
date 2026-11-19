@@ -17,7 +17,7 @@ from rest_framework_simplejwt.token_blacklist.models import BlacklistedToken
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from config.settings import check_shared_throttle_cache
-from .models import EmailVerification, PasswordResetRequest, User
+from .models import AccountDeletionRequest, EmailVerification, PasswordResetRequest, User
 
 
 class EmailVerificationTests(TestCase):
@@ -905,3 +905,156 @@ class GoogleSignInSecurityTests(APITestCase):
 		with patch('google.oauth2.id_token.verify_oauth2_token', return_value=expired_claims):
 			expired_resp = self.client.post(self.url, {'credential': 'tok-expired'}, format='json')
 		self.assertEqual(expired_resp.status_code, 400)
+
+
+class GoogleOnlyAccountDeletionTests(APITestCase):
+	def setUp(self):
+		cache.clear()
+		self.google_user = User(email='google.del@example.com', google_sub='sub-del-1')
+		self.google_user.set_unusable_password()
+		self.google_user.save()
+
+		self.other_google_user = User(email='other.del@example.com', google_sub='sub-del-2')
+		self.other_google_user.set_unusable_password()
+		self.other_google_user.save()
+
+		self.password_user = User.objects.create_user(
+			email='pw.del@example.com',
+			password='StrongPassw0rd!',
+		)
+		self.request_url = reverse('delete-account-request')
+		self.delete_url = reverse('delete-account')
+
+	def tearDown(self):
+		cache.clear()
+
+	def _request_code(self, user, randbelow_val=123456):
+		self.client.force_authenticate(user)
+		with patch('accounts.views.secrets.randbelow', return_value=randbelow_val), patch(
+			'accounts.views.send_mail'
+		) as mock_mail:
+			resp = self.client.post(self.request_url, {}, format='json')
+		return resp, mock_mail, str(randbelow_val + 100000)
+
+	def test_password_user_cannot_request_deletion_otp_and_still_requires_password(self):
+		self.client.force_authenticate(self.password_user)
+		req_resp = self.client.post(self.request_url, {}, format='json')
+		self.assertEqual(req_resp.status_code, 400)
+
+		bad_pw = self.client.delete(self.delete_url, {'password': 'WrongPassword!1'}, format='json')
+		self.assertEqual(bad_pw.status_code, 401)
+		self.assertTrue(User.objects.filter(pk=self.password_user.pk).exists())
+
+		ok_pw = self.client.delete(self.delete_url, {'password': 'StrongPassw0rd!'}, format='json')
+		self.assertEqual(ok_pw.status_code, 200)
+		self.assertFalse(User.objects.filter(pk=self.password_user.pk).exists())
+
+	def test_request_stores_hashed_otp_and_deletes_user_on_valid_code(self):
+		deleted_pk = self.google_user.pk
+		deleted_email = self.google_user.email
+		refresh = RefreshToken.for_user(self.google_user)
+		access_token = str(refresh.access_token)
+		EmailVerification.objects.create(
+			email=deleted_email, code_hash='h', password_hash='p'
+		)
+		PasswordResetRequest.objects.create(email=deleted_email, code_hash='h')
+
+		req_resp, mock_mail, code = self._request_code(self.google_user, randbelow_val=234567)
+		self.assertEqual(req_resp.status_code, 200)
+		mock_mail.assert_called_once()
+		self.assertEqual(mock_mail.call_args.kwargs['recipient_list'], [deleted_email])
+
+		record = AccountDeletionRequest.objects.get(user=self.google_user)
+		self.assertNotEqual(record.code_hash, code)
+
+		# Missing or malformed code rejected cleanly without deleting account
+		self.assertEqual(
+			self.client.delete(self.delete_url, {}, format='json').status_code,
+			400,
+		)
+		self.assertEqual(
+			self.client.delete(self.delete_url, {'code': 'abcdef'}, format='json').status_code,
+			400,
+		)
+		self.assertTrue(User.objects.filter(pk=deleted_pk).exists())
+
+		# Valid code deletes user, revokes refresh tokens, and purges related OTP records
+		del_resp = self.client.delete(self.delete_url, {'code': code}, format='json')
+		self.assertEqual(del_resp.status_code, 200)
+		self.assertFalse(User.objects.filter(pk=deleted_pk).exists())
+		self.assertFalse(AccountDeletionRequest.objects.filter(user_id=deleted_pk).exists())
+		self.assertFalse(EmailVerification.objects.filter(email=deleted_email).exists())
+		self.assertFalse(PasswordResetRequest.objects.filter(email=deleted_email).exists())
+		self.assertTrue(BlacklistedToken.objects.filter(token__token=str(refresh)).exists())
+
+		# Reusing the deleted account's Bearer JWT + OTP code is rejected
+		self.client.force_authenticate(user=None)
+		reuse = self.client.delete(
+			self.delete_url,
+			{'code': code},
+			format='json',
+			HTTP_AUTHORIZATION=f'Bearer {access_token}',
+		)
+		self.assertEqual(reuse.status_code, 401)
+
+	def test_five_wrong_codes_purge_deletion_request(self):
+		req_resp, _, real_code = self._request_code(self.google_user, randbelow_val=111111)
+		self.assertEqual(req_resp.status_code, 200)
+
+		for _ in range(AccountDeletionRequest.MAX_ATTEMPTS):
+			resp = self.client.delete(self.delete_url, {'code': '000000'}, format='json')
+			self.assertEqual(resp.status_code, 400)
+
+		self.assertFalse(AccountDeletionRequest.objects.filter(user=self.google_user).exists())
+		late = self.client.delete(self.delete_url, {'code': real_code}, format='json')
+		self.assertEqual(late.status_code, 400)
+		self.assertTrue(User.objects.filter(pk=self.google_user.pk).exists())
+
+	def test_expired_and_other_users_code_are_rejected(self):
+		_, _, other_code = self._request_code(self.other_google_user, randbelow_val=555555)
+		_, _, my_code = self._request_code(self.google_user, randbelow_val=666666)
+
+		# Victim cannot be deleted with another user's valid code
+		self.client.force_authenticate(self.google_user)
+		cross = self.client.delete(self.delete_url, {'code': other_code}, format='json')
+		self.assertEqual(cross.status_code, 400)
+		self.assertTrue(User.objects.filter(pk=self.google_user.pk).exists())
+
+		# Expire my_code beyond EXPIRY_MINUTES
+		record = AccountDeletionRequest.objects.get(user=self.google_user)
+		AccountDeletionRequest.objects.filter(pk=record.pk).update(
+			created_at=timezone.now() - timedelta(minutes=AccountDeletionRequest.EXPIRY_MINUTES + 1)
+		)
+		expired = self.client.delete(self.delete_url, {'code': my_code}, format='json')
+		self.assertEqual(expired.status_code, 400)
+		self.assertFalse(AccountDeletionRequest.objects.filter(pk=record.pk).exists())
+		self.assertTrue(User.objects.filter(pk=self.google_user.pk).exists())
+
+	def test_deletion_request_and_confirm_rate_limits(self):
+		self.client.force_authenticate(self.google_user)
+		with patch('accounts.views.send_mail'):
+			for _ in range(5):
+				resp = self.client.post(self.request_url, {}, format='json')
+				self.assertEqual(resp.status_code, 200)
+			# 6th request hits per-email limit (5/hour)
+			email_limited = self.client.post(self.request_url, {}, format='json')
+			self.assertEqual(email_limited.status_code, 429)
+
+		# Additional confirm attempts hit PasswordActionRateThrottle (10/hour per user across views)
+		self.client.force_authenticate(self.other_google_user)
+		for _ in range(10):
+			resp = self.client.delete(self.delete_url, {'code': '000000'}, format='json')
+			self.assertEqual(resp.status_code, 400)
+		throttled = self.client.delete(self.delete_url, {'code': '000000'}, format='json')
+		self.assertEqual(throttled.status_code, 429)
+
+	def test_deletion_request_fails_closed_on_cache_outage(self):
+		self.client.force_authenticate(self.google_user)
+		failing_cache = MagicMock()
+		failing_cache.get.side_effect = ConnectionError('redis down')
+		failing_cache.add.side_effect = ConnectionError('redis down')
+		with patch('rest_framework.throttling.SimpleRateThrottle.cache', failing_cache), patch(
+			'accounts.views.cache', failing_cache
+		):
+			resp = self.client.post(self.request_url, {}, format='json')
+		self.assertEqual(resp.status_code, 503)

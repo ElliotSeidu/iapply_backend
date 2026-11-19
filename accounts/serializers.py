@@ -136,10 +136,17 @@ class ChangePasswordSerializer(serializers.Serializer):
 
 
 class DeleteAccountSerializer(serializers.Serializer):
-    # Optional so Google-only accounts (no usable password) can delete their
-    # account. The view still enforces the password for password accounts.
+    # Password accounts confirm deletion with `password`; Google-only accounts
+    # (no usable password) confirm deletion with a 6-digit emailed OTP `code`.
     password = serializers.CharField(
         write_only=True, required=False, allow_blank=True, default='', max_length=128
+    )
+    code = serializers.RegexField(
+        regex=r'^\d{6}$',
+        required=False,
+        allow_blank=True,
+        default='',
+        error_messages={'invalid': 'Enter the 6-digit code from your email.'},
     )
 
 

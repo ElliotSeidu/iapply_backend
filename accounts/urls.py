@@ -2,8 +2,9 @@ from django.urls import path
 
 from .views import (
     ChangePasswordView,
-    GoogleLoginView,
+    DeleteAccountRequestView,
     DeleteAccountView,
+    GoogleLoginView,
     LogoutView,
     MeView,
     MyTokenObtainPairView,
@@ -26,6 +27,7 @@ urlpatterns = [
     path('profile/', MeView.as_view(), name='profile'),
     path('update-profile/', UpdateUserView.as_view(), name="update-profile"),
     path('change-password/', ChangePasswordView.as_view(), name="change-password"),
+    path('delete-account/request/', DeleteAccountRequestView.as_view(), name='delete-account-request'),
     path('delete-account/', DeleteAccountView.as_view(), name='delete-account'),  # was 'deletePassword'
     path('logout/', LogoutView.as_view(), name='logout'),
 ]

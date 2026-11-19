@@ -106,3 +106,30 @@ class PasswordResetRequest(models.Model):
 
     def __str__(self):
         return f"PasswordReset for {self.email}"
+
+
+class AccountDeletionRequest(models.Model):
+    """
+    Short-lived emailed one-time code for confirming deletion of an account
+    without a usable password (e.g. Google-only accounts).
+    """
+
+    MAX_ATTEMPTS = 5
+    EXPIRY_MINUTES = 10
+
+    user = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name='deletion_requests',
+    )
+    code_hash = models.CharField(max_length=256)
+    created_at = models.DateTimeField(auto_now_add=True)
+    attempts = models.PositiveSmallIntegerField(default=0)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['user', '-created_at']),
+        ]
+
+    def __str__(self):
+        return f"AccountDeletionRequest for user {self.user_id}"
